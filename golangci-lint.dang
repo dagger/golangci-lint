@@ -1,0 +1,247 @@
+"""
+Lint Go modules in a Dagger workspace with golangci-lint.
+"""
+type GolangciLint {
+  """
+  golangci-lint version. Null when a custom base container is configured.
+  """
+  pub version: String
+
+  """
+  Container providing golangci-lint, Go, and any required system dependencies.
+  """
+  pub base: Container!
+
+  """
+  Extra workspace-root include patterns mounted for every module.
+  """
+  pub includeExtraFiles: [String!]! = []
+
+  """
+  Module roots to lint ("!" excludes; see the constructor argument).
+  """
+  pub lint: [String!]! = ["**"]
+
+  new(
+    """
+    golangci-lint version for the default Alpine image, without the v prefix.
+    """
+    version: String = null,
+    """
+    Custom container with golangci-lint and Go installed. Mutually exclusive
+    with version. Install any required C/C++ toolchain or libraries here.
+    """
+    base: Container = null,
+    includeExtraFiles: [String!]! = [],
+    """
+    Module roots to lint. Bare patterns select, "!"-prefixed patterns exclude,
+    and exclusions always win. With no selecting pattern, all modules are
+    selected. "**" or "*" matches all modules; "X" or "X/**" matches X and
+    modules below it. Other glob forms are not interpreted.
+    Examples: ["!docs"] selects everything except docs; ["!**"] skips all.
+    """
+    lint: [String!]! = ["**"],
+  ) {
+    if (version != null and base != null) {
+      raise "version and base are mutually exclusive"
+    } else {
+      self.version = if (base == null) { version ?? "2.11.4" } else { null }
+      self.base = base ?? container
+        .from(if (version == null) {
+          "docker.io/golangci/golangci-lint:v2.11.4-alpine@sha256:72bcd68512b4e27540dd3a778a1b7afd45759d8145cfb3c089f1d7af53e718e9"
+        } else {
+          "docker.io/golangci/golangci-lint:v" + version.trimPrefix("v") + "-alpine"
+        })
+        # cgo dependencies may need a C/C++ toolchain during typecheck.
+        .withExec(["apk", "add", "--no-cache", "build-base"])
+      self.includeExtraFiles = includeExtraFiles
+      # Older beta engines pass TOML arrays as JSON-fragment strings.
+      self.lint = lint.map { p =>
+        p.trimPrefix("[").trimSuffix("]").trimPrefix("\"").trimSuffix("\"")
+      }
+      self
+    }
+  }
+
+  """
+  Discover Go modules at or below the workspace cwd, including its enclosing
+  module. Paths and include/exclude globs are workspace-root-relative.
+  """
+  pub modules(
+    ws: Workspace!,
+    include: [String!]! = [],
+    exclude: [String!]! = [],
+    includeSkipLint: Boolean! = true,
+  ): [GoModule!]! {
+    ws.findRoots(markers: ["go.mod"])
+      .map { root =>
+        # findRoots returns cwd-relative paths, including ".." for ancestors.
+        let segments = root.split("/").filter { part => part != "" and part != "." }
+        let up = segments.filter { part => part == ".." }.length
+        let down = segments.filter { part => part != ".." }
+        let resolved = ws.cwd.split("/").filter { part => part != "" }.dropLast(up) + down
+        if (resolved.length == 0) { "." } else { resolved.join("/") }
+      }
+      .filter { modPath =>
+        if (include.length == 0 and exclude.length == 0) {
+          true
+        } else {
+          ws.directory(
+            "/",
+            include: if (include.length == 0) { ["**"] } else { include },
+            exclude: exclude,
+          ).glob(if (modPath == ".") { "**" } else { modPath + "/**" }).length > 0
+        }
+      }
+      .map { modPath => module(ws, modPath, findUp: false) }
+      .filter { mod => includeSkipLint or mod.skipLint(ws) == false }
+  }
+
+  """
+  Return the Go module containing a workspace directory. Set findUp to false
+  when path is already a workspace-root-relative module root.
+  """
+  pub module(ws: Workspace!, path: String!, findUp: Boolean! = true): GoModule! {
+    GoModule(
+      path: if (findUp) {
+        let found = ws.findUp("go.mod", path)
+        if (found == null) {
+          raise "no Go module found containing path: " + path
+        } else {
+          let goModPath = found.trimPrefix("/")
+          if (goModPath == "go.mod") { "." } else { goModPath.trimSuffix("/go.mod") }
+        }
+      } else {
+        path.trimPrefix("/")
+      },
+      baseImage: base,
+      includeExtraFiles: includeExtraFiles,
+      lintPatterns: lint,
+    )
+  }
+
+  """
+  Run golangci-lint in every selected Go module.
+  """
+  pub lintAll(ws: Workspace!): Void @check {
+    let layers = modules(ws, includeSkipLint: false).reduce(directory) { layers, mod =>
+      layers.withDirectory(
+        mod.path,
+        directory.withFile("go.mod", mod.lintExec(ws).file("go.mod")),
+      )
+    }
+    # Merge a file from each lint container to force all commands to run in
+    # parallel until Dagger supports parallel sub-checks directly.
+    layers.sync
+    null
+  }
+}
+
+"""
+A Go module rooted at a workspace-relative path, ready for golangci-lint.
+"""
+type GoModule {
+  pub path: String!
+  let baseImage: Container!
+  let includeExtraFiles: [String!]!
+  let lintPatterns: [String!]!
+
+  """
+  Whether this module falls outside the configured lint selection.
+  """
+  pub skipLint(ws: Workspace!): Boolean! {
+    let included = lintPatterns.filter { p => p.hasPrefix("!") == false }
+    let excluded = lintPatterns.filter { p => p.hasPrefix("!") }.map { p => p.trimPrefix("!") }
+    let isIncluded = included.length == 0 or included.any { p => matchesModulePath(p) }
+    let isExcluded = excluded.any { p => matchesModulePath(p) }
+    isIncluded == false or isExcluded
+  }
+
+  let matchesModulePath(pattern: String!): Boolean! {
+    let p = pattern.trimPrefix("/").trimSuffix("/")
+    if (p == "**" or p == "*") {
+      true
+    } else {
+      let prefix = p.trimSuffix("/**")
+      path == prefix or path.hasPrefix(prefix + "/")
+    }
+  }
+
+  """
+  Base lint container with shared Go and golangci-lint caches.
+  """
+  pub base: Container! {
+    baseImage
+      .withoutEntrypoint
+      .withMountedCache("/go/pkg/mod", cacheVolume("go-mod"))
+      .withEnvVariable("GOMODCACHE", "/go/pkg/mod")
+      .withMountedCache("/root/.cache/go-build", cacheVolume("go-build"))
+      .withEnvVariable("GOCACHE", "/root/.cache/go-build")
+      .withMountedCache("/root/.cache/golangci-lint", cacheVolume("golangci-lint"))
+      .withWorkdir("/src")
+  }
+
+  """
+  Source patterns discovered from Go files, go:embed directives, and transitive
+  local go.mod replacements. Test/generate-only include directives are ignored.
+  """
+  pub includeDiscovered(ws: Workspace!): [String!]! {
+    # Every module computes the same helper container, so the engine scans the
+    # source snapshot once and each module reads only its own output file.
+    let index = base
+      .withDirectory("/helpers/go-includes", currentModule.source.directory("helpers/go-includes"))
+      .withWorkdir("/helpers/go-includes")
+      .withExec(["go", "build", "-o", "/usr/local/bin/go-includes", "."])
+      .withDirectory("/ws", ws.directory("/", include: ["**/*.go", "**/go.mod"]))
+      .withWorkdir("/ws")
+      .withExec(["go-includes", "--output-dir", "/output"])
+      .directory("/output")
+    index.file((if (path == ".") { "_root_" } else { path }) + ".inc")
+      .contents.split("\n").filter { pattern => pattern != "" }
+  }
+
+  """
+  Final workspace-root include patterns, including golangci-lint configuration.
+  """
+  pub include(ws: Workspace!): [String!]! {
+    includeExtraFiles + includeDiscovered(ws) + [
+      "**/.golangci.yml",
+      "**/.golangci.yaml",
+      "**/.golangci.toml",
+      "**/.golangci.json",
+    ]
+  }
+
+  """
+  Workspace-shaped source directory mounted for linting this module.
+  """
+  pub source(ws: Workspace!): Directory! {
+    ws.directory("/", include: include(ws))
+  }
+
+  """
+  Run golangci-lint in this module, respecting the configured selection.
+  """
+  pub lint(ws: Workspace!): Void @check {
+    if (skipLint(ws) == false) {
+      lintExec(ws).sync
+    }
+    null
+  }
+
+  let lintExec(ws: Workspace!): Container! {
+    base
+      .withDirectory(".", source(ws))
+      .withWorkdir(path)
+      .withExec([
+        "golangci-lint", "run",
+        "--path-prefix", path + "/",
+        "--output.tab.path=stderr",
+        "--output.tab.print-linter-name=true",
+        "--output.tab.colors=false",
+        "--show-stats=false",
+        "--max-issues-per-linter=0",
+        "--max-same-issues=0",
+      ])
+  }
+}
