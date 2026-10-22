@@ -12,6 +12,17 @@ type E2e {
     null
   }
 
+  # Calling a @check function returns a Check; run it and raise its failure.
+  let run(check: Check!): Void {
+    if (check.pass == false) { raise failureOf(check) }
+    null
+  }
+
+  let failureOf(check: Check!): String! {
+    let err = check.error
+    if (err == null) { "unexpected success" } else { err.message }
+  }
+
   let selectsOut(ws: Workspace!, patterns: [String!]!, path: String!): Boolean! {
     golangciLint(lint: patterns).module(ws, path, findUp: false).skipLint(ws)
   }
@@ -23,9 +34,9 @@ type E2e {
     assert(paths.contains(parentPath + "/nested"), "nested module was not discovered")
     assert(paths.contains(".") == false, "invented a root Go module")
     assert(tool.module(ws, embedPath + "/testdata").path == embedPath, "lookup did not find enclosing module")
-    let missing = try {
+    let missing = {
       tool.module(ws, ".").path
-    } catch { err => err.message }
+    } rescue { err: Error => err.message }
     assert(missing.contains("no Go module found"), "missing module lookup succeeded")
 
     let below = tool.modules(ws.withWorkdir(parentPath)).{{path}}.map { mod => mod.path }
@@ -33,7 +44,7 @@ type E2e {
     assert(below.contains(parentPath), "subdirectory discovery changed workspace-relative paths")
     let inside = ws.withWorkdir(embedPath + "/testdata")
     assert(tool.modules(inside).{{path}}.map { mod => mod.path }.contains(embedPath), "ancestor discovery failed")
-    tool.lintAll(inside)
+    run(tool.lintAll(inside))
 
     let included = tool.modules(ws, include: [embedPath + "/**"]).{{path}}
     assert(included.length == 1, "module include filter failed")
@@ -60,8 +71,8 @@ type E2e {
     let tool = golangciLint(lint: ["!" + failurePath])
     assert(tool.modules(ws).{{path}}.map { mod => mod.path }.contains(failurePath), "discovery hid skipped module")
     assert(tool.modules(ws, includeSkipLint: false).{{path}}.map { mod => mod.path }.contains(failurePath) == false, "skip filter failed")
-    tool.module(ws, failurePath).lint(ws)
-    golangciLint(lint: ["!**"]).lintAll(ws)
+    run(tool.module(ws, failurePath).lint(ws))
+    run(golangciLint(lint: ["!**"]).lintAll(ws))
     null
   }
 
@@ -75,25 +86,19 @@ type E2e {
     assert(files.contains(failurePath + "/lint_fail.go") == false, "another module leaked into lint source")
     let extra = golangciLint(includeExtraFiles: ["LICENSE"]).module(ws, embedPath).source(ws)
     assert(extra.file("LICENSE").contents.contains("Apache License"), "extra include was not mounted")
-    golangciLint.module(ws, "fixtures/go-module-with-replace").lint(ws)
-    golangciLint.module(ws, parentPath).lint(ws)
+    run(golangciLint.module(ws, "fixtures/go-module-with-replace").lint(ws))
+    run(golangciLint.module(ws, parentPath).lint(ws))
     null
   }
 
   pub lintAllCheck(ws: Workspace!): Void @check {
-    golangciLint(lint: ["!" + failurePath, "!" + emptyPath]).lintAll(ws)
+    run(golangciLint(lint: ["!" + failurePath, "!" + emptyPath]).lintAll(ws))
   }
 
   pub failureCheck(ws: Workspace!): Void @check {
-    let failure = try {
-      golangciLint(lint: ["!" + emptyPath]).module(ws, failurePath).lint(ws)
-      "unexpected success"
-    } catch { err => err.message }
+    let failure = failureOf(golangciLint(lint: ["!" + emptyPath]).module(ws, failurePath).lint(ws))
     assert(failure.contains("exit code: 1"), "lint did not report the fixture error: " + failure)
-    let allFailure = try {
-      golangciLint(lint: [failurePath]).lintAll(ws)
-      "unexpected success"
-    } catch { err => err.message }
+    let allFailure = failureOf(golangciLint(lint: [failurePath]).lintAll(ws))
     assert(allFailure.contains("exit code: 1"), "lint-all swallowed failure: " + allFailure)
     null
   }
@@ -107,10 +112,7 @@ type E2e {
       let ws = source.withNewFile(name, "invalid configuration").asWorkspace
       let mod = golangciLint.module(ws, ".")
       assert(mod.source(ws).file(name).contents == "invalid configuration", "configuration file missing: " + name)
-      let failure = try {
-        mod.lint(ws)
-        "unexpected success"
-      } catch { err => err.message }
+      let failure = failureOf(mod.lint(ws))
       assert(failure.contains("exit code: 3"), "golangci-lint ignored " + name + ": " + failure)
     }
     null
@@ -124,14 +126,11 @@ type E2e {
     assert(tool.version == null, "custom base exposed an assumed version")
     assert(golangciLint.version == "2.11.4", "default version changed")
     assert(golangciLint(version: "2.11.4").version == "2.11.4", "version override was lost")
-    let conflict = try {
+    let conflict = {
       golangciLint(version: "2.11.4", base: custom).version ?? "no error"
-    } catch { err => err.message }
+    } rescue { err: Error => err.message }
     assert(conflict.contains("mutually exclusive"), "version and base conflict was accepted")
-    let failure = try {
-      tool.module(ws, embedPath).lint(ws)
-      "unexpected success"
-    } catch { err => err.message }
+    let failure = failureOf(tool.module(ws, embedPath).lint(ws))
     assert(failure.contains("exit code: 42"), "custom base was ignored: " + failure)
     null
   }
