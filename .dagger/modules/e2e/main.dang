@@ -6,6 +6,13 @@ type E2e {
   let embedPath: String! = "testdata/go-module-with-testdata"
   let parentPath: String! = "fixtures/go-module-with-nested-module"
   let emptyPath: String! = "testdata/go-module-empty"
+  let driverPath: String! = "testdata/export-driver/app"
+  let olderPath: String! = "testdata/export-driver/older"
+  let compileErrorPath: String! = "testdata/export-driver/compileerr"
+  let testCompileErrorPath: String! = "testdata/export-driver/testcompileerr"
+  # golangci-lint built from source with the fixtures' Go.
+  let lintVersion: String! = "2.14.0"
+  let lintGo: String! = "1.26"
 
   let assert(condition: Boolean!, message: String!): Void {
     if (condition == false) { raise message }
@@ -92,7 +99,75 @@ type E2e {
   }
 
   pub lintAllCheck(ws: Workspace!): Void @check {
-    run(golangciLint(lint: ["!" + failurePath, "!" + emptyPath]).lintAll(ws))
+    run(golangciLint(lint: ["!" + failurePath, "!" + emptyPath, "!testdata/export-driver"]).lintAll(ws))
+  }
+
+  # The findings in a lint report: golangci-lint's tab output, one line per
+  # line of output (a finding can span several), without the exit code and
+  # the export driver's report.
+  let findings(report: String!, path: String!): [String!]! {
+    report.split("\n").filter { line =>
+      line != "" and line.hasPrefix("exit code: ") == false and line.hasPrefix("{") == false
+    }
+  }
+
+  # Archives for a module's packages and their tests' imports, written from
+  # the go command's own export data: a stand-in for a per-package builder.
+  let archivesFor(ws: Workspace!, path: String!): Directory! {
+    let mod = golangciLint(version: lintVersion, goVersion: lintGo).module(ws, path)
+    mod.base
+      .withFile("/usr/local/bin/golangci-export-driver", mod.exportDriver)
+      .withDirectory("/src", mod.source(ws))
+      .withWorkdir("/src/" + path)
+      .withExec(["golangci-export-driver", "--write-manifest=/archives", "--", "./..."])
+      .directory("/archives")
+  }
+
+  pub exportDriverFindingsCheck(ws: Workspace!): Void @check {
+    let plain = golangciLint(version: lintVersion, goVersion: lintGo).module(ws, driverPath).lintReport(ws)
+    let driven = golangciLint(version: lintVersion, goVersion: lintGo, exportArchives: archivesFor(ws, driverPath))
+      .module(ws, driverPath).lintReport(ws)
+    let want = findings(plain, driverPath)
+    let got = findings(driven, driverPath)
+    # Linting that silently finds nothing would pass the comparison below.
+    assert(want.filter { f => f.contains("SA1019") and f.contains("io/ioutil") }.length == 1, "fixture lost its standard library deprecation: " + plain)
+    assert(want.filter { f => f.contains("SA1019") and f.contains("exportlib.Old") }.length == 1, "fixture lost its dependency deprecation: " + plain)
+    assert(want.filter { f => f.contains("ineffassign") }.length > 0, "fixture lost its ineffectual assignments: " + plain)
+    assert(got.length > 0, "linting through the export driver found nothing: " + driven)
+    assert(got == want, "findings differ through the export driver:\nwithout:\n" + want.join("\n") + "\nwith:\n" + got.join("\n"))
+    assert(plain.hasPrefix("exit code: 1") and driven.hasPrefix("exit code: 1"), "lint exit codes differ: " + plain + "\n" + driven)
+    # The driver served the request: prebuilt archives for the standard
+    # library and the replaced module, and a compiled test variant.
+    assert(driven.contains("\"declined\"") == false, "export driver declined: " + driven)
+    assert(driven.contains("\"prebuilt\":"), "export driver used no prebuilt archive: " + driven)
+    assert(driven.contains("\"compiled\":"), "export driver compiled no test variant: " + driven)
+    null
+  }
+
+  # golangci-lint stops analyzing at the first package that doesn't
+  # type-check, so each fixture has one: in a package, or only in its test.
+  pub exportDriverCompileErrorCheck(ws: Workspace!): Void @check {
+    [compileErrorPath, testCompileErrorPath].map { path =>
+      let plain = golangciLint(version: lintVersion, goVersion: lintGo).module(ws, path).lintReport(ws)
+      let driven = golangciLint(version: lintVersion, goVersion: lintGo, exportArchives: archivesFor(ws, path))
+        .module(ws, path).lintReport(ws)
+      let want = findings(plain, path)
+      assert(want.filter { f => f.contains("go:embed") }.length == 1, "fixture lost its compile error: " + plain)
+      assert(findings(driven, path) == want, "findings differ through the export driver:\n" + plain + "\n" + driven)
+      assert(driven.contains("\"declined\"") == false, "export driver declined: " + driven)
+    }
+    null
+  }
+
+  pub exportDriverDeclinesCheck(ws: Workspace!): Void @check {
+    let plain = golangciLint(version: lintVersion, goVersion: lintGo).module(ws, olderPath).lintReport(ws)
+    let driven = golangciLint(version: lintVersion, goVersion: lintGo, exportArchives: archivesFor(ws, olderPath))
+      .module(ws, olderPath).lintReport(ws)
+    let want = findings(plain, olderPath)
+    assert(want.filter { f => f.contains("stdversion") or f.contains("requires go1.26") }.length == 1, "fixture lost its stdversion finding: " + plain)
+    assert(findings(driven, olderPath) == want, "findings differ when the export driver declines: " + driven)
+    assert(driven.contains("\"declined\""), "export driver served a module on an older Go: " + driven)
+    null
   }
 
   pub failureCheck(ws: Workspace!): Void @check {
@@ -132,6 +207,14 @@ type E2e {
     assert(conflict.contains("mutually exclusive"), "version and base conflict was accepted")
     let failure = failureOf(tool.module(ws, embedPath).lint(ws))
     assert(failure.contains("exit code: 42"), "custom base was ignored: " + failure)
+    let goConflict = {
+      golangciLint(goVersion: lintGo, base: custom).version ?? "no error"
+    } rescue { err: Error => err.message }
+    assert(goConflict.contains("mutually exclusive"), "goVersion and base conflict was accepted")
+    let built = golangciLint(version: lintVersion, goVersion: lintGo)
+    assert(built.goVersion == lintGo, "goVersion was lost")
+    let reported = built.base.withExec(["golangci-lint", "version"]).stdout
+    assert(reported.contains(lintVersion) and reported.contains("go" + lintGo), "golangci-lint was not built from source with Go " + lintGo + ": " + reported)
     null
   }
 
