@@ -22,6 +22,18 @@ type GolangciLint {
   """
   pub lint: [String!]! = ["**"]
 
+  """
+  Go version golangci-lint is built with from source, or null for
+  golangci-lint's own image.
+  """
+  pub goVersion: String
+
+  """
+  Prebuilt per-package archives that golangci-lint reads export data from,
+  or null to let the go command compile every dependency.
+  """
+  pub exportArchives: Directory
+
   new(
     """
     golangci-lint version for the default Alpine image, without the v prefix.
@@ -41,19 +53,56 @@ type GolangciLint {
     Examples: ["!docs"] selects everything except docs; ["!**"] skips all.
     """
     lint: [String!]! = ["**"],
+    """
+    Go version to build golangci-lint with from source, in the official
+    golang Alpine image, such as "1.26". golangci-lint's own image is built
+    with its newest Go. Building with the Go version the linted modules
+    declare lets golangci-lint read prebuilt export data (exportArchives)
+    and type-check those modules at their own language version. Mutually
+    exclusive with base.
+    """
+    goVersion: String = null,
+    """
+    Prebuilt per-package archives to read export data from instead of
+    compiling every dependency: a directory with a manifest.json and the
+    archives it lists (see helpers/export-driver). golangci-lint loads them
+    through a GOPACKAGESDRIVER that checks each archive against the package's
+    sources and falls back to the go command for anything it can't verify.
+    The driver only serves modules whose Go language version is the one
+    golangci-lint was built with (see goVersion); for any other module,
+    golangci-lint lints exactly as without archives.
+    """
+    exportArchives: Directory = null,
   ) {
     if (version != null and base != null) {
       raise "version and base are mutually exclusive"
+    } else if (goVersion != null and base != null) {
+      raise "goVersion and base are mutually exclusive"
     } else {
       self.version = if (base == null) { version ?? "2.11.4" } else { null }
-      self.base = base ?? container
-        .from(if (version == null) {
-          "docker.io/golangci/golangci-lint:v2.11.4-alpine@sha256:72bcd68512b4e27540dd3a778a1b7afd45759d8145cfb3c089f1d7af53e718e9"
-        } else {
-          "docker.io/golangci/golangci-lint:v" + version.trimPrefix("v") + "-alpine"
-        })
-        # cgo dependencies may need a C/C++ toolchain during typecheck.
-        .withExec(["apk", "add", "--no-cache", "build-base"])
+      self.goVersion = goVersion
+      self.exportArchives = exportArchives
+      let image = if (goVersion == null) {
+        container
+          .from(if (version == null) {
+            "docker.io/golangci/golangci-lint:v2.11.4-alpine@sha256:72bcd68512b4e27540dd3a778a1b7afd45759d8145cfb3c089f1d7af53e718e9"
+          } else {
+            "docker.io/golangci/golangci-lint:v" + version.trimPrefix("v") + "-alpine"
+          })
+          # cgo dependencies may need a C/C++ toolchain during typecheck.
+          .withExec(["apk", "add", "--no-cache", "build-base"])
+      } else {
+        container
+          .from("docker.io/library/golang:" + goVersion + "-alpine")
+          .withExec(["apk", "add", "--no-cache", "build-base", "git"])
+          .withEnvVariable("CGO_ENABLED", "0")
+          .withExec([
+            "go", "install",
+            "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v" + (version ?? "2.11.4").trimPrefix("v"),
+          ])
+          .withoutEnvVariable("CGO_ENABLED")
+      }
+      self.base = base ?? image
       self.includeExtraFiles = includeExtraFiles
       # Older beta engines pass TOML arrays as JSON-fragment strings.
       self.lint = lint.map { p =>
@@ -117,6 +166,10 @@ type GolangciLint {
       baseImage: base,
       includeExtraFiles: includeExtraFiles,
       lintPatterns: lint,
+      # A golangci-lint built with another Go keeps its caches apart:
+      # golangci-lint keys its cache on its own version, not its Go.
+      cacheSuffix: if (goVersion == null) { "" } else { "-go" + goVersion },
+      exportArchives: exportArchives,
     )
   }
 
@@ -145,6 +198,8 @@ type GoModule {
   let baseImage: Container!
   let includeExtraFiles: [String!]!
   let lintPatterns: [String!]!
+  let cacheSuffix: String!
+  let exportArchives: Directory
 
   """
   Whether this module falls outside the configured lint selection.
@@ -175,9 +230,9 @@ type GoModule {
       .withoutEntrypoint
       .withMountedCache("/go/pkg/mod", cacheVolume("go-mod"))
       .withEnvVariable("GOMODCACHE", "/go/pkg/mod")
-      .withMountedCache("/root/.cache/go-build", cacheVolume("go-build"))
+      .withMountedCache("/root/.cache/go-build", cacheVolume("go-build" + cacheSuffix))
       .withEnvVariable("GOCACHE", "/root/.cache/go-build")
-      .withMountedCache("/root/.cache/golangci-lint", cacheVolume("golangci-lint"))
+      .withMountedCache("/root/.cache/golangci-lint", cacheVolume("golangci-lint" + cacheSuffix))
       .withWorkdir("/src")
   }
 
@@ -229,19 +284,76 @@ type GoModule {
     null
   }
 
+  """
+  golangci-lint's findings for this module, and the export driver's report
+  when exportArchives is set, whether or not the lint passes. It lints with
+  an empty golangci-lint cache, so that it analyzes everything rather than
+  replaying findings cached by an earlier lint.
+  """
+  pub lintReport(ws: Workspace!): String! {
+    let ran = lintContainer(ws)
+      .withMountedDirectory("/root/.cache/golangci-lint", directory)
+      .withExec(lintCommand, expect: ReturnType.ANY)
+    "exit code: " + toString(ran.exitCode) + "\n" + ran.stderr
+  }
+
   let lintExec(ws: Workspace!): Container! {
-    base
+    lintContainer(ws).withExec(lintCommand)
+  }
+
+  let lintArgs: [String!]! {
+    [
+      "golangci-lint", "run",
+      "--path-prefix", path + "/",
+      "--output.tab.path=stderr",
+      "--output.tab.print-linter-name=true",
+      "--output.tab.colors=false",
+      "--show-stats=false",
+      "--max-issues-per-linter=0",
+      "--max-same-issues=0",
+    ]
+  }
+
+  # With exportArchives, the driver's report follows the findings on stderr,
+  # keeping golangci-lint's exit code.
+  let lintCommand: [String!]! {
+    if (exportArchives == null) {
+      lintArgs
+    } else {
+      [
+        "sh", "-c",
+        "\"$@\"; rc=$?; cat /tmp/export-driver.log >&2 2>/dev/null; exit $rc",
+        "lint",
+      ] + lintArgs
+    }
+  }
+
+  let lintContainer(ws: Workspace!): Container! {
+    let lintBase = if (exportArchives == null) {
+      base
+    } else {
+      base
+        .withFile("/usr/local/bin/golangci-export-driver", exportDriver)
+        .withMountedDirectory("/export-archives", exportArchives)
+        .withEnvVariable("GOPACKAGESDRIVER", "/usr/local/bin/golangci-export-driver")
+        .withEnvVariable("GOLANGCI_EXPORT_ARCHIVES", "/export-archives")
+        .withEnvVariable("GOLANGCI_EXPORT_DRIVER_LOG", "/tmp/export-driver.log")
+        .withEnvVariable("GOLANGCI_EXPORT_WORKDIR", "/tmp/export-driver")
+    }
+    lintBase
       .withDirectory(".", source(ws))
       .withWorkdir(path)
-      .withExec([
-        "golangci-lint", "run",
-        "--path-prefix", path + "/",
-        "--output.tab.path=stderr",
-        "--output.tab.print-linter-name=true",
-        "--output.tab.colors=false",
-        "--show-stats=false",
-        "--max-issues-per-linter=0",
-        "--max-same-issues=0",
-      ])
+  }
+
+  """
+  The GOPACKAGESDRIVER serving export data from exportArchives.
+  """
+  pub exportDriver: File! {
+    base
+      .withDirectory("/helpers/export-driver", currentModule.source.directory("helpers/export-driver"))
+      .withWorkdir("/helpers/export-driver")
+      .withEnvVariable("CGO_ENABLED", "0")
+      .withExec(["go", "build", "-o", "/usr/local/bin/golangci-export-driver", "."])
+      .file("/usr/local/bin/golangci-export-driver")
   }
 }
