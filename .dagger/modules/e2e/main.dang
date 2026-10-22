@@ -225,6 +225,12 @@ type E2e {
       .withWorkdir("/helper")
       .withExec(["go", "test", "./..."])
       .sync
+    golangciLint(version: lintVersion, goVersion: lintGo).base
+      .withoutEntrypoint
+      .withDirectory("/src", ws.directory("/helpers/export-driver"))
+      .withWorkdir("/src")
+      .withExec(["go", "test", "./..."])
+      .sync
     null
   }
 }
