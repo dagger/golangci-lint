@@ -592,3 +592,32 @@ func TestTagsOnTheCommandLineOverrideGOFLAGS(t *testing.T) {
 		t.Errorf("declined archives built with the tags the request builds with: %s", rep.Declined)
 	}
 }
+
+// TestQuotedTagsParseAsGoDoes checks GOFLAGS' quoting and the -tags forms
+// the go command accepts: tags it builds with from GOFLAGS alone match the
+// same tags set on the command line.
+func TestQuotedTagsParseAsGoDoes(t *testing.T) {
+	for _, tc := range []struct{ goflags, flag string }{
+		{"-tags='envtag'", "-tags=envtag"},
+		{"'-tags=a b'", "-tags=a,b"},
+		{"\"-tags=a,b\"", "-tags=b,a"},
+	} {
+		t.Run(tc.goflags, func(t *testing.T) {
+			mod := writeModule(t, toolchainLang())
+			t.Setenv("GOFLAGS", tc.goflags)
+			out := t.TempDir()
+			t.Chdir(mod)
+			if err := writeManifestDir(context.Background(), out, []string{"--", "./..."}); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("GOFLAGS", "")
+			resp, rep := serveModule(t, mod, out, func(r *packages.DriverRequest) {
+				r.BuildFlags = append(r.BuildFlags, tc.flag)
+				r.Env = os.Environ()
+			})
+			if resp.NotHandled {
+				t.Errorf("declined archives built with GOFLAGS=%s for a request with %s: %s", tc.goflags, tc.flag, rep.Declined)
+			}
+		})
+	}
+}

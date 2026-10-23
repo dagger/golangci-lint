@@ -205,10 +205,64 @@ func buildTags(flags []string) []string {
 		default:
 			continue
 		}
-		tags = strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ' ' })
+		tags = tagsValue(v)
 	}
 	sort.Strings(tags)
 	return tags
+}
+
+// tagsValue parses a -tags value as the go command does: split on commas,
+// unless it has a space or a quote, which the go command allows for
+// compatibility, as a quoted, space-separated list.
+func tagsValue(v string) []string {
+	if strings.ContainsAny(v, " '") {
+		tags, err := quotedSplit(v)
+		if err != nil {
+			return []string{v} // go rejects it; no archives match
+		}
+		return tags
+	}
+	var tags []string
+	for _, t := range strings.Split(v, ",") {
+		if t != "" {
+			tags = append(tags, t)
+		}
+	}
+	return tags
+}
+
+// quotedSplit splits s into fields as the go command splits GOFLAGS:
+// separated by spaces, each optionally in single or double quotes, with
+// nothing unescaped inside them.
+func quotedSplit(s string) ([]string, error) {
+	isSpace := func(b byte) bool { return b == ' ' || b == '\t' || b == '\n' || b == '\r' }
+	var fields []string
+	for len(s) > 0 {
+		for len(s) > 0 && isSpace(s[0]) {
+			s = s[1:]
+		}
+		if len(s) == 0 {
+			break
+		}
+		if s[0] == '"' || s[0] == '\'' {
+			quote := s[0]
+			s = s[1:]
+			i := strings.IndexByte(s, quote)
+			if i < 0 {
+				return nil, fmt.Errorf("unterminated %c string", quote)
+			}
+			fields = append(fields, s[:i])
+			s = s[i+1:]
+			continue
+		}
+		i := 0
+		for i < len(s) && !isSpace(s[i]) {
+			i++
+		}
+		fields = append(fields, s[:i])
+		s = s[i:]
+	}
+	return fields, nil
 }
 
 func sameStrings(a, b []string) bool {

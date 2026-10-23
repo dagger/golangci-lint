@@ -111,7 +111,11 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 	if err != nil {
 		return nil, report{}, err
 	}
-	if reason := unsupportedGOFLAGS(env["GOFLAGS"]); reason != "" {
+	goflags, err := quotedSplit(env["GOFLAGS"])
+	if err != nil {
+		return declined("GOFLAGS: " + err.Error())
+	}
+	if reason := unsupportedGOFLAGS(goflags); reason != "" {
 		return declined(reason)
 	}
 	switch {
@@ -123,7 +127,7 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 		return declined("archives built with a different CGO_ENABLED")
 	}
 	// Flags on the command line override GOFLAGS', so they come last.
-	tags := buildTags(append(strings.Fields(env["GOFLAGS"]), req.BuildFlags...))
+	tags := buildTags(append(goflags, req.BuildFlags...))
 	if !sameStrings(tags, nonNil(m.BuildTags)) {
 		return declined(fmt.Sprintf("archives built with tags %v, request has %v", m.BuildTags, tags))
 	}
@@ -199,8 +203,8 @@ func unsupportedBuildFlags(flags []string) string {
 	return ""
 }
 
-func unsupportedGOFLAGS(goflags string) string {
-	if reason := unsupportedBuildFlags(strings.Fields(goflags)); reason != "" {
+func unsupportedGOFLAGS(goflags []string) string {
+	if reason := unsupportedBuildFlags(goflags); reason != "" {
 		return "GOFLAGS: " + reason
 	}
 	return ""

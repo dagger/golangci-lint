@@ -33,6 +33,10 @@ func writeManifestDir(ctx context.Context, out string, args []string) error {
 	if err != nil {
 		return err
 	}
+	goflags, err := quotedSplit(env["GOFLAGS"])
+	if err != nil {
+		return fmt.Errorf("GOFLAGS: %w", err)
+	}
 	listArgs := append([]string{"list", "-e", "-export", "-compiled", "-deps", "-test",
 		"-json=ImportPath,ForTest,Dir,Export,GoFiles,CgoFiles,CompiledGoFiles,EmbedFiles,CFiles,CXXFiles,HFiles,SFiles,MFiles,FFiles,SwigFiles,SwigCXXFiles,SysoFiles"},
 		flags...)
@@ -54,7 +58,7 @@ func writeManifestDir(ctx context.Context, out string, args []string) error {
 		GOARCH:     env["GOARCH"],
 		CgoEnabled: env["CGO_ENABLED"] == "1",
 		// Flags on the command line override GOFLAGS', so they come last.
-		BuildTags: nonNil(buildTags(append(strings.Fields(env["GOFLAGS"]), flags...))),
+		BuildTags: nonNil(buildTags(append(goflags, flags...))),
 		Packages:  map[string]manifestEntry{},
 	}
 	dec := json.NewDecoder(&stdout)
