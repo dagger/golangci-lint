@@ -122,7 +122,8 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 	case m.CgoEnabled != (env["CGO_ENABLED"] == "1"):
 		return declined("archives built with a different CGO_ENABLED")
 	}
-	tags := buildTags(append(slices.Clone(req.BuildFlags), strings.Fields(env["GOFLAGS"])...))
+	// Flags on the command line override GOFLAGS', so they come last.
+	tags := buildTags(append(strings.Fields(env["GOFLAGS"]), req.BuildFlags...))
 	if !sameStrings(tags, nonNil(m.BuildTags)) {
 		return declined(fmt.Sprintf("archives built with tags %v, request has %v", m.BuildTags, tags))
 	}

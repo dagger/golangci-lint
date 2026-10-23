@@ -53,8 +53,9 @@ func writeManifestDir(ctx context.Context, out string, args []string) error {
 		GOOS:       env["GOOS"],
 		GOARCH:     env["GOARCH"],
 		CgoEnabled: env["CGO_ENABLED"] == "1",
-		BuildTags:  nonNil(buildTags(append(flags, strings.Fields(env["GOFLAGS"])...))),
-		Packages:   map[string]manifestEntry{},
+		// Flags on the command line override GOFLAGS', so they come last.
+		BuildTags: nonNil(buildTags(append(strings.Fields(env["GOFLAGS"]), flags...))),
+		Packages:  map[string]manifestEntry{},
 	}
 	dec := json.NewDecoder(&stdout)
 	for {

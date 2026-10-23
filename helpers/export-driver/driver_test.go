@@ -565,3 +565,30 @@ func TestMissingArchiveIsNotUsed(t *testing.T) {
 		t.Errorf("lib's export data: %v", err)
 	}
 }
+
+// TestTagsOnTheCommandLineOverrideGOFLAGS checks that the tags the go
+// command builds with are the ones compared: a -tags flag overrides
+// GOFLAGS', in the archives a builder records and in the request.
+func TestTagsOnTheCommandLineOverrideGOFLAGS(t *testing.T) {
+	mod := writeModule(t, toolchainLang())
+	t.Setenv("GOFLAGS", "-tags=envtag")
+	out := t.TempDir()
+	t.Chdir(mod)
+	if err := writeManifestDir(context.Background(), out, []string{"-tags=explicit", "--", "./..."}); err != nil {
+		t.Fatal(err)
+	}
+	m, err := readManifest(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameStrings(m.BuildTags, []string{"explicit"}) {
+		t.Errorf("manifest buildTags = %v, want [explicit]: the flag overrides GOFLAGS", m.BuildTags)
+	}
+	resp, rep := serveModule(t, mod, out, func(r *packages.DriverRequest) {
+		r.BuildFlags = append(r.BuildFlags, "-tags=explicit")
+		r.Env = os.Environ()
+	})
+	if resp.NotHandled {
+		t.Errorf("declined archives built with the tags the request builds with: %s", rep.Declined)
+	}
+}
