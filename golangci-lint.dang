@@ -104,10 +104,7 @@ type GolangciLint {
       }
       self.base = base ?? image
       self.includeExtraFiles = includeExtraFiles
-      # Older beta engines pass TOML arrays as JSON-fragment strings.
-      self.lint = lint.map { p =>
-        p.trimPrefix("[").trimSuffix("]").trimPrefix("\"").trimSuffix("\"")
-      }
+      self.lint = lint
       self
     }
   }

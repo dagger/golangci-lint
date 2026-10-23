@@ -75,7 +75,6 @@ type E2e {
     assert(selectsOut(ws, ["**", "!docs", "docs/keep"], "docs/keep"), "include overrode exclusion")
     assert(selectsOut(ws, ["."], ".") == false, "root selection failed")
     assert(selectsOut(ws, ["."], "core"), "root selection leaked to another module")
-    assert(selectsOut(ws, ["[\"!docs\"", "\"!tmp\"]"], "docs"), "beta settings normalization failed")
     let tool = golangciLint(lint: ["!" + failurePath])
     assert(tool.modules(ws).{{path}}.map { mod => mod.path }.contains(failurePath), "discovery hid skipped module")
     assert(tool.modules(ws, includeSkipLint: false).{{path}}.map { mod => mod.path }.contains(failurePath) == false, "skip filter failed")
