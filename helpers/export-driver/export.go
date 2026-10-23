@@ -31,10 +31,6 @@ import (
 //     other package without non-Go files);
 //  3. the export data `go list -export` builds, as without the driver.
 func assignExportData(ctx context.Context, cfg *packages.Config, m *manifest, dir string, roots []*packages.Package, rep *report) error {
-	isRoot := map[*packages.Package]bool{}
-	for _, r := range roots {
-		isRoot[r] = true
-	}
 	var all []*packages.Package
 	packages.Visit(roots, nil, func(p *packages.Package) { all = append(all, p) })
 
@@ -71,7 +67,7 @@ func assignExportData(ctx context.Context, cfg *packages.Config, m *manifest, di
 	}
 
 	// needed: every package whose archive must exist, so the caller can load
-	// a non-root package or this driver can compile one.
+	// it or this driver can compile one that imports it.
 	needed := map[*packages.Package]bool{}
 	var need func(p *packages.Package)
 	need = func(p *packages.Package) {
@@ -91,19 +87,14 @@ func assignExportData(ctx context.Context, cfg *packages.Config, m *manifest, di
 	served := func(p *packages.Package) bool {
 		return p.PkgPath != "unsafe" && !isTestMain(p)
 	}
+	// Root test packages (test variants and external tests) are served too.
+	// golangci-lint type-checks those it lints from source, which misses
+	// errors only the compiler reports, such as //go:embed on a variable of
+	// the wrong type or a function without a body. go list -export compiles
+	// them all, so this driver does too: those that fail get go list's error.
 	for _, p := range all {
 		if served(p) {
 			need(p)
-		}
-	}
-	// golangci-lint type-checks root test packages (test variants and
-	// external tests) from source, which misses errors only the compiler
-	// reports, such as //go:embed on a variable of the wrong type or a
-	// function without a body. go list -export compiles them all, so this
-	// driver does too: those that fail get go list's error.
-	for _, r := range roots {
-		if r.ID != r.PkgPath && !isTestMain(r) {
-			need(r)
 		}
 	}
 
