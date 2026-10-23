@@ -9,6 +9,7 @@ type E2e {
   let driverPath: String! = "testdata/export-driver/app"
   let olderPath: String! = "testdata/export-driver/older"
   let compileErrorPath: String! = "testdata/export-driver/compileerr"
+  let warmPath: String! = "testdata/export-driver/warm"
   let testCompileErrorPath: String! = "testdata/export-driver/testcompileerr"
   # golangci-lint built from source with the fixtures' Go.
   let lintVersion: String! = "2.14.0"
@@ -156,6 +157,19 @@ type E2e {
       assert(findings(driven, path) == want, "findings differ through the export driver:\n" + plain + "\n" + driven)
       assert(driven.contains("\"declined\"") == false, "export driver declined: " + driven)
     }
+    null
+  }
+
+  # A lint after an edit, with golangci-lint's cache from the lint before:
+  # golangci-lint skips the packages whose findings it has cached, root test
+  # variants included, and loads them from export data instead when an
+  # edited package it analyzes imports them.
+  pub exportDriverWarmCacheCheck(ws: Workspace!): Void @check {
+    let tool = golangciLint(version: lintVersion, goVersion: lintGo, exportArchives: archivesFor(ws, warmPath))
+    run(tool.module(ws, warmPath).lint(ws))
+    let edited = ws.withNewFile(warmPath + "/q/q.go", "// Package q uses p.\npackage q\n\nimport \"example.com/warm/p\"\n\n// Q returns more than P.\nfunc Q() int { return p.P() + 2 }\n")
+    let editedTool = golangciLint(version: lintVersion, goVersion: lintGo, exportArchives: archivesFor(edited, warmPath))
+    run(editedTool.module(edited, warmPath).lint(edited))
     null
   }
 

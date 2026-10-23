@@ -15,13 +15,13 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-// assignExportData sets ExportFile on every package the caller may load from
-// export data: every package that isn't a root, and every plain (not test
-// variant) root. golangci-lint lints a package with internal tests only
-// through its test variant "p [p.test]" and loads the plain root p from export
-// data, as go list -export gives every package. Root test variants get none
-// unless a compile here needs them, as the caller type-checks them from
-// source.
+// assignExportData sets ExportFile on every package golangci-lint may load
+// from export data, as go list -export does: every package but unsafe and
+// the generated test mains, which golangci-lint skips. It type-checks the
+// packages it lints from source, but it lints a package with internal tests
+// through its test variant and loads the plain package from export data, and
+// it doesn't lint a package whose findings it has cached, which it loads from
+// export data when a package it does analyze imports it.
 //
 // Each package gets, in order of preference:
 //  1. its prebuilt archive, if the archive's sources match the package's and
@@ -89,7 +89,7 @@ func assignExportData(ctx context.Context, cfg *packages.Config, m *manifest, di
 		}
 	}
 	served := func(p *packages.Package) bool {
-		return p.PkgPath != "unsafe" && !isTestMain(p) && (!isRoot[p] || p.ID == p.PkgPath)
+		return p.PkgPath != "unsafe" && !isTestMain(p)
 	}
 	for _, p := range all {
 		if served(p) {

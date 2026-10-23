@@ -114,15 +114,13 @@ func TestServesFilesAndExportData(t *testing.T) {
 		if p.PkgPath == "unsafe" {
 			continue
 		}
-		if roots[p.ID] && p.ID != p.PkgPath {
-			continue // a root test variant, type-checked from source
-		}
 		if isTestMain(p) {
 			continue // a generated test main, which golangci-lint skips
 		}
-		// Every other package may be loaded from export data: golangci-lint
-		// lints a package with internal tests through its test variant and
-		// loads the plain package from export data.
+		// Every other package may be loaded from export data, roots and
+		// their test variants included: golangci-lint loads a package whose
+		// findings it has cached from export data when a package it analyzes
+		// imports it.
 		if p.ExportFile == "" {
 			t.Errorf("dependency %s has no export data", p.ID)
 		} else if _, err := os.Stat(p.ExportFile); err != nil {
