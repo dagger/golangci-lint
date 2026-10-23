@@ -28,9 +28,6 @@ const (
 	// envWorkDir is where compiled archives are written; they must outlive
 	// the driver, since the caller reads them after it exits.
 	envWorkDir = "GOLANGCI_EXPORT_WORKDIR"
-	// envLinterGo overrides the Go version the calling linter was built
-	// with, which is otherwise read from the parent process's binary.
-	envLinterGo = "GOLANGCI_EXPORT_LINTER_GO"
 )
 
 // report is the JSON line written to envLog for each request.
@@ -235,11 +232,10 @@ func goEnv(ctx context.Context, env []string) (map[string]string, error) {
 
 // linterGoVersion is the Go version the calling linter (the driver's parent
 // process) was built with: the version it type-checks with when a package
-// has no Module, as packages served by a driver don't.
-func linterGoVersion() (string, error) {
-	if v := os.Getenv(envLinterGo); v != "" {
-		return v, nil
-	}
+// has no Module, as packages served by a driver don't. Tests replace it.
+var linterGoVersion = parentGoVersion
+
+func parentGoVersion() (string, error) {
 	info, err := buildinfo.ReadFile(fmt.Sprintf("/proc/%d/exe", os.Getppid()))
 	if err != nil {
 		return "", err

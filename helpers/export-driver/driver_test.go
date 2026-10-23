@@ -72,7 +72,7 @@ func serveModule(t *testing.T, mod, archives string, mutate func(*packages.Drive
 	t.Chdir(mod)
 	t.Setenv(envArchives, archives)
 	t.Setenv(envWorkDir, t.TempDir())
-	t.Setenv(envLinterGo, runtime.Version())
+	linterIs(t, runtime.Version())
 	req := &packages.DriverRequest{Mode: golangciMode, Env: os.Environ(), Tests: true, BuildFlags: golangciFlags}
 	if mutate != nil {
 		mutate(req)
@@ -211,7 +211,7 @@ func TestDeclines(t *testing.T) {
 		name     string
 		archives func(t *testing.T) string
 		mutate   func(*packages.DriverRequest)
-		env      map[string]string
+		linter   string
 		module   string
 	}{
 		{name: "no archives", archives: func(*testing.T) string { return "" }},
@@ -228,7 +228,7 @@ func TestDeclines(t *testing.T) {
 		{name: "overlay", archives: func(t *testing.T) string { return archives },
 			mutate: func(r *packages.DriverRequest) { r.Overlay = map[string][]byte{"x.go": nil} }},
 		{name: "linter built with another Go", archives: func(t *testing.T) string { return archives },
-			env: map[string]string{envLinterGo: "go1.1.0"}},
+			linter: "go1.1.0"},
 		{name: "module on an older Go", archives: func(t *testing.T) string { return archives }, module: "1.22"},
 	}
 	for _, tc := range cases {
@@ -241,9 +241,9 @@ func TestDeclines(t *testing.T) {
 			t.Chdir(m)
 			t.Setenv(envArchives, dir)
 			t.Setenv(envWorkDir, t.TempDir())
-			t.Setenv(envLinterGo, runtime.Version())
-			for k, v := range tc.env {
-				t.Setenv(k, v)
+			linterIs(t, runtime.Version())
+			if tc.linter != "" {
+				linterIs(t, tc.linter)
 			}
 			req := &packages.DriverRequest{Mode: golangciMode, Env: os.Environ(), Tests: true, BuildFlags: golangciFlags}
 			if tc.mutate != nil {
@@ -279,7 +279,6 @@ func TestGoPackagesThroughDriver(t *testing.T) {
 		envArchives+"="+archives,
 		envLog+"="+logPath,
 		envWorkDir+"="+t.TempDir(),
-		envLinterGo+"="+runtime.Version(),
 	)
 	pkgs, err := packages.Load(&packages.Config{
 		// Without NeedDeps, go/packages type-checks only the roots from
@@ -620,4 +619,13 @@ func TestQuotedTagsParseAsGoDoes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// linterIs makes the driver see a linter built with Go version v for the
+// rest of the test, instead of reading its parent process's binary.
+func linterIs(t *testing.T, v string) {
+	t.Helper()
+	old := linterGoVersion
+	linterGoVersion = func() (string, error) { return v, nil }
+	t.Cleanup(func() { linterGoVersion = old })
 }
