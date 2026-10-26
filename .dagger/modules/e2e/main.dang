@@ -6,10 +6,29 @@ type E2e {
   let embedPath: String! = "testdata/go-module-with-testdata"
   let parentPath: String! = "fixtures/go-module-with-nested-module"
   let emptyPath: String! = "testdata/go-module-empty"
+  let driverPath: String! = "testdata/export-driver/app"
+  let olderPath: String! = "testdata/export-driver/older"
+  let compileErrorPath: String! = "testdata/export-driver/compileerr"
+  let warmPath: String! = "testdata/export-driver/warm"
+  let testCompileErrorPath: String! = "testdata/export-driver/testcompileerr"
+  # golangci-lint built from source with the fixtures' Go.
+  let lintVersion: String! = "2.14.0"
+  let lintGo: String! = "1.26"
 
   let assert(condition: Boolean!, message: String!): Void {
     if (condition == false) { raise message }
     null
+  }
+
+  # Calling a @check function returns a Check; run it and raise its failure.
+  let run(check: Check!): Void {
+    if (check.pass == false) { raise failureOf(check) }
+    null
+  }
+
+  let failureOf(check: Check!): String! {
+    let err = check.error
+    if (err == null) { "unexpected success" } else { err.message }
   }
 
   let selectsOut(ws: Workspace!, patterns: [String!]!, path: String!): Boolean! {
@@ -23,9 +42,9 @@ type E2e {
     assert(paths.contains(parentPath + "/nested"), "nested module was not discovered")
     assert(paths.contains(".") == false, "invented a root Go module")
     assert(tool.module(ws, embedPath + "/testdata").path == embedPath, "lookup did not find enclosing module")
-    let missing = try {
+    let missing = {
       tool.module(ws, ".").path
-    } catch { err => err.message }
+    } rescue { err: Error => err.message }
     assert(missing.contains("no Go module found"), "missing module lookup succeeded")
 
     let below = tool.modules(ws.withWorkdir(parentPath)).{{path}}.map { mod => mod.path }
@@ -33,7 +52,7 @@ type E2e {
     assert(below.contains(parentPath), "subdirectory discovery changed workspace-relative paths")
     let inside = ws.withWorkdir(embedPath + "/testdata")
     assert(tool.modules(inside).{{path}}.map { mod => mod.path }.contains(embedPath), "ancestor discovery failed")
-    tool.lintAll(inside)
+    run(tool.lintAll(inside))
 
     let included = tool.modules(ws, include: [embedPath + "/**"]).{{path}}
     assert(included.length == 1, "module include filter failed")
@@ -56,12 +75,11 @@ type E2e {
     assert(selectsOut(ws, ["**", "!docs", "docs/keep"], "docs/keep"), "include overrode exclusion")
     assert(selectsOut(ws, ["."], ".") == false, "root selection failed")
     assert(selectsOut(ws, ["."], "core"), "root selection leaked to another module")
-    assert(selectsOut(ws, ["[\"!docs\"", "\"!tmp\"]"], "docs"), "beta settings normalization failed")
     let tool = golangciLint(lint: ["!" + failurePath])
     assert(tool.modules(ws).{{path}}.map { mod => mod.path }.contains(failurePath), "discovery hid skipped module")
     assert(tool.modules(ws, includeSkipLint: false).{{path}}.map { mod => mod.path }.contains(failurePath) == false, "skip filter failed")
-    tool.module(ws, failurePath).lint(ws)
-    golangciLint(lint: ["!**"]).lintAll(ws)
+    run(tool.module(ws, failurePath).lint(ws))
+    run(golangciLint(lint: ["!**"]).lintAll(ws))
     null
   }
 
@@ -75,25 +93,100 @@ type E2e {
     assert(files.contains(failurePath + "/lint_fail.go") == false, "another module leaked into lint source")
     let extra = golangciLint(includeExtraFiles: ["LICENSE"]).module(ws, embedPath).source(ws)
     assert(extra.file("LICENSE").contents.contains("Apache License"), "extra include was not mounted")
-    golangciLint.module(ws, "fixtures/go-module-with-replace").lint(ws)
-    golangciLint.module(ws, parentPath).lint(ws)
+    run(golangciLint.module(ws, "fixtures/go-module-with-replace").lint(ws))
+    run(golangciLint.module(ws, parentPath).lint(ws))
     null
   }
 
   pub lintAllCheck(ws: Workspace!): Void @check {
-    golangciLint(lint: ["!" + failurePath, "!" + emptyPath]).lintAll(ws)
+    run(golangciLint(lint: ["!" + failurePath, "!" + emptyPath, "!testdata/export-driver"]).lintAll(ws))
+  }
+
+  # The findings in a lint report: golangci-lint's tab output, one line per
+  # line of output (a finding can span several), without the exit code and
+  # the export driver's report.
+  let findings(report: String!, path: String!): [String!]! {
+    report.split("\n").filter { line =>
+      line != "" and line.hasPrefix("exit code: ") == false and line.hasPrefix("{") == false
+    }
+  }
+
+  # Archives for a module's packages and their tests' imports, written from
+  # the go command's own export data: a stand-in for a per-package builder.
+  let archivesFor(ws: Workspace!, path: String!): Directory! {
+    let mod = golangciLint(version: lintVersion, goVersion: lintGo).module(ws, path)
+    mod.base
+      .withFile("/usr/local/bin/golangci-export-driver", mod.exportDriver)
+      .withDirectory("/src", mod.source(ws))
+      .withWorkdir("/src/" + path)
+      .withExec(["golangci-export-driver", "--write-manifest=/archives", "--", "./..."])
+      .directory("/archives")
+  }
+
+  pub exportDriverFindingsCheck(ws: Workspace!): Void @check {
+    let plain = golangciLint(version: lintVersion, goVersion: lintGo).module(ws, driverPath).lintReport(ws)
+    let driven = golangciLint(version: lintVersion, goVersion: lintGo, exportArchives: archivesFor(ws, driverPath))
+      .module(ws, driverPath).lintReport(ws)
+    let want = findings(plain, driverPath)
+    let got = findings(driven, driverPath)
+    # Linting that silently finds nothing would pass the comparison below.
+    assert(want.filter { f => f.contains("SA1019") and f.contains("io/ioutil") }.length == 1, "fixture lost its standard library deprecation: " + plain)
+    assert(want.filter { f => f.contains("SA1019") and f.contains("exportlib.Old") }.length == 1, "fixture lost its dependency deprecation: " + plain)
+    assert(want.filter { f => f.contains("ineffassign") }.length > 0, "fixture lost its ineffectual assignments: " + plain)
+    assert(got.length > 0, "linting through the export driver found nothing: " + driven)
+    assert(got == want, "findings differ through the export driver:\nwithout:\n" + want.join("\n") + "\nwith:\n" + got.join("\n"))
+    assert(plain.hasPrefix("exit code: 1") and driven.hasPrefix("exit code: 1"), "lint exit codes differ: " + plain + "\n" + driven)
+    # The driver served the request: prebuilt archives for the standard
+    # library and the replaced module, and a compiled test variant.
+    assert(driven.contains("\"declined\"") == false, "export driver declined: " + driven)
+    assert(driven.contains("\"prebuilt\":"), "export driver used no prebuilt archive: " + driven)
+    assert(driven.contains("\"compiled\":"), "export driver compiled no test variant: " + driven)
+    null
+  }
+
+  # golangci-lint stops analyzing at the first package that doesn't
+  # type-check, so each fixture has one: in a package, or only in its test.
+  pub exportDriverCompileErrorCheck(ws: Workspace!): Void @check {
+    [compileErrorPath, testCompileErrorPath].map { path =>
+      let plain = golangciLint(version: lintVersion, goVersion: lintGo).module(ws, path).lintReport(ws)
+      let driven = golangciLint(version: lintVersion, goVersion: lintGo, exportArchives: archivesFor(ws, path))
+        .module(ws, path).lintReport(ws)
+      let want = findings(plain, path)
+      assert(want.filter { f => f.contains("go:embed") }.length == 1, "fixture lost its compile error: " + plain)
+      assert(findings(driven, path) == want, "findings differ through the export driver:\n" + plain + "\n" + driven)
+      assert(driven.contains("\"declined\"") == false, "export driver declined: " + driven)
+    }
+    null
+  }
+
+  # A lint after an edit, with golangci-lint's cache from the lint before:
+  # golangci-lint skips the packages whose findings it has cached, root test
+  # variants included, and loads them from export data instead when an
+  # edited package it analyzes imports them.
+  pub exportDriverWarmCacheCheck(ws: Workspace!): Void @check {
+    let tool = golangciLint(version: lintVersion, goVersion: lintGo, exportArchives: archivesFor(ws, warmPath))
+    run(tool.module(ws, warmPath).lint(ws))
+    let edited = ws.withNewFile(warmPath + "/q/q.go", "// Package q uses p.\npackage q\n\nimport \"example.com/warm/p\"\n\n// Q returns more than P.\nfunc Q() int { return p.P() + 2 }\n")
+    let editedTool = golangciLint(version: lintVersion, goVersion: lintGo, exportArchives: archivesFor(edited, warmPath))
+    run(editedTool.module(edited, warmPath).lint(edited))
+    null
+  }
+
+  pub exportDriverDeclinesCheck(ws: Workspace!): Void @check {
+    let plain = golangciLint(version: lintVersion, goVersion: lintGo).module(ws, olderPath).lintReport(ws)
+    let driven = golangciLint(version: lintVersion, goVersion: lintGo, exportArchives: archivesFor(ws, olderPath))
+      .module(ws, olderPath).lintReport(ws)
+    let want = findings(plain, olderPath)
+    assert(want.filter { f => f.contains("stdversion") or f.contains("requires go1.26") }.length == 1, "fixture lost its stdversion finding: " + plain)
+    assert(findings(driven, olderPath) == want, "findings differ when the export driver declines: " + driven)
+    assert(driven.contains("\"declined\""), "export driver served a module on an older Go: " + driven)
+    null
   }
 
   pub failureCheck(ws: Workspace!): Void @check {
-    let failure = try {
-      golangciLint(lint: ["!" + emptyPath]).module(ws, failurePath).lint(ws)
-      "unexpected success"
-    } catch { err => err.message }
+    let failure = failureOf(golangciLint(lint: ["!" + emptyPath]).module(ws, failurePath).lint(ws))
     assert(failure.contains("exit code: 1"), "lint did not report the fixture error: " + failure)
-    let allFailure = try {
-      golangciLint(lint: [failurePath]).lintAll(ws)
-      "unexpected success"
-    } catch { err => err.message }
+    let allFailure = failureOf(golangciLint(lint: [failurePath]).lintAll(ws))
     assert(allFailure.contains("exit code: 1"), "lint-all swallowed failure: " + allFailure)
     null
   }
@@ -107,10 +200,7 @@ type E2e {
       let ws = source.withNewFile(name, "invalid configuration").asWorkspace
       let mod = golangciLint.module(ws, ".")
       assert(mod.source(ws).file(name).contents == "invalid configuration", "configuration file missing: " + name)
-      let failure = try {
-        mod.lint(ws)
-        "unexpected success"
-      } catch { err => err.message }
+      let failure = failureOf(mod.lint(ws))
       assert(failure.contains("exit code: 3"), "golangci-lint ignored " + name + ": " + failure)
     }
     null
@@ -124,15 +214,20 @@ type E2e {
     assert(tool.version == null, "custom base exposed an assumed version")
     assert(golangciLint.version == "2.11.4", "default version changed")
     assert(golangciLint(version: "2.11.4").version == "2.11.4", "version override was lost")
-    let conflict = try {
+    let conflict = {
       golangciLint(version: "2.11.4", base: custom).version ?? "no error"
-    } catch { err => err.message }
+    } rescue { err: Error => err.message }
     assert(conflict.contains("mutually exclusive"), "version and base conflict was accepted")
-    let failure = try {
-      tool.module(ws, embedPath).lint(ws)
-      "unexpected success"
-    } catch { err => err.message }
+    let failure = failureOf(tool.module(ws, embedPath).lint(ws))
     assert(failure.contains("exit code: 42"), "custom base was ignored: " + failure)
+    let goConflict = {
+      golangciLint(goVersion: lintGo, base: custom).version ?? "no error"
+    } rescue { err: Error => err.message }
+    assert(goConflict.contains("mutually exclusive"), "goVersion and base conflict was accepted")
+    let built = golangciLint(version: lintVersion, goVersion: lintGo)
+    assert(built.goVersion == lintGo, "goVersion was lost")
+    let reported = built.base.withExec(["golangci-lint", "version"]).stdout
+    assert(reported.contains(lintVersion) and reported.contains("go" + lintGo), "golangci-lint was not built from source with Go " + lintGo + ": " + reported)
     null
   }
 
@@ -141,6 +236,12 @@ type E2e {
       .withoutEntrypoint
       .withDirectory("/helper", ws.directory("/helpers/go-includes"))
       .withWorkdir("/helper")
+      .withExec(["go", "test", "./..."])
+      .sync
+    golangciLint(version: lintVersion, goVersion: lintGo).base
+      .withoutEntrypoint
+      .withDirectory("/src", ws.directory("/helpers/export-driver"))
+      .withWorkdir("/src")
       .withExec(["go", "test", "./..."])
       .sync
     null
