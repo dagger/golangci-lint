@@ -116,7 +116,10 @@ func writeManifestDir(ctx context.Context, out string, args []string) error {
 		entry := manifestEntry{Archive: filepath.ToSlash(rel), Sources: digest}
 		if len(p.CgoFiles) > 0 {
 			entry.CgoFiles = p.CgoFiles
-			entry.Module = moduleVersion(p.Module)
+			// A module version names the files only from the module cache.
+			if rel, err := filepath.Rel(env["GOMODCACHE"], p.Dir); env["GOMODCACHE"] != "" && err == nil && !strings.HasPrefix(rel, "..") {
+				entry.Module = moduleVersion(p.Module)
+			}
 			plain := map[string]bool{}
 			for _, g := range abs(p.GoFiles) {
 				plain[g] = true
