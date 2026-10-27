@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -152,8 +153,11 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 	if err != nil {
 		return nil, report{}, err
 	}
+	// cgo's output in the archives is good only for the C settings it was
+	// made with; with others, the go command lists cgo's output afresh.
+	cgoMatches := m.CgoEnabled && maps.Equal(m.Cgo, cgoSettings(ctx, env))
 	listedCompiled := false
-	if !compiledFromManifest(m, dir, roots) {
+	if !compiledFromManifest(m, dir, roots, cgoMatches) {
 		cfg.Mode |= packages.NeedCompiledGoFiles
 		if roots, err = packages.Load(cfg, patterns...); err != nil {
 			return nil, report{}, err
@@ -196,16 +200,18 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 
 // compiledFromManifest sets each package's compiled Go files as the go
 // command would list them, and reports whether it could for all of them. A
-// package in the manifest compiles its Go files, or for a cgo package its
-// other Go files and cgo's output in the manifest's directory. A package
-// with no Go files, unsafe and a test main, whose _testmain.go has no cgo,
-// compile their Go files too. Any other package may use cgo, which only the
-// go command can tell.
-func compiledFromManifest(m *manifest, dir string, roots []*packages.Package) bool {
+// package in the manifest compiles its Go files, or for a cgo package, when
+// cgoMatches, its other Go files and cgo's output in the manifest's
+// directory. A package with no Go files, unsafe and a test main, whose
+// _testmain.go has no cgo, compile their Go files too. Any other package may
+// use cgo, which only the go command can tell.
+func compiledFromManifest(m *manifest, dir string, roots []*packages.Package, cgoMatches bool) bool {
 	ok := true
 	packages.Visit(roots, nil, func(p *packages.Package) {
 		e, listed := m.Packages[p.ID]
 		switch {
+		case listed && len(e.CgoOutput) > 0 && !cgoMatches:
+			ok = false
 		case listed && len(e.CgoOutput) > 0:
 			cgo := map[string]bool{}
 			for _, f := range e.CgoFiles {
@@ -263,7 +269,7 @@ func nonNil(s []string) []string {
 }
 
 func goEnv(ctx context.Context, env []string) (map[string]string, error) {
-	cmd := exec.CommandContext(ctx, "go", "env", "-json", "GOVERSION", "GOOS", "GOARCH", "CGO_ENABLED", "GOFLAGS")
+	cmd := exec.CommandContext(ctx, "go", append([]string{"env", "-json", "GOVERSION", "GOOS", "GOARCH", "CGO_ENABLED", "GOFLAGS"}, cgoVars...)...)
 	cmd.Env = env
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

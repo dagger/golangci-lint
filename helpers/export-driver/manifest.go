@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"go/token"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -25,13 +27,17 @@ const manifestVersion = 2
 // with. Packages are keyed by their ID as go list -test names them: the
 // import path, or "p [p.test]" for a variant compiled for p's test.
 type manifest struct {
-	Version    int                      `json:"version"`
-	GoVersion  string                   `json:"goVersion"`
-	GOOS       string                   `json:"goos"`
-	GOARCH     string                   `json:"goarch"`
-	CgoEnabled bool                     `json:"cgoEnabled"`
-	BuildTags  []string                 `json:"buildTags"`
-	Packages   map[string]manifestEntry `json:"packages"`
+	Version    int    `json:"version"`
+	GoVersion  string `json:"goVersion"`
+	GOOS       string `json:"goos"`
+	GOARCH     string `json:"goarch"`
+	CgoEnabled bool   `json:"cgoEnabled"`
+	// Cgo, with cgo enabled, is what cgo's output depends on besides the
+	// sources (cgoSettings): the archives' cgo output is good only for the
+	// same.
+	Cgo       map[string]string        `json:"cgo,omitempty"`
+	BuildTags []string                 `json:"buildTags"`
+	Packages  map[string]manifestEntry `json:"packages"`
 }
 
 type manifestEntry struct {
@@ -45,6 +51,25 @@ type manifestEntry struct {
 	// the package compiles its other Go files and those.
 	CgoFiles  []string `json:"cgoFiles,omitempty"`
 	CgoOutput []string `json:"cgoOutput,omitempty"`
+}
+
+// cgoVars are the go command's settings cgo's output depends on.
+var cgoVars = []string{"CC", "CXX", "CGO_CFLAGS", "CGO_CPPFLAGS", "CGO_CXXFLAGS", "CGO_FFLAGS", "CGO_LDFLAGS"}
+
+// cgoSettings is what cgo's output depends on besides a package's sources,
+// from go env: cgoVars, and "ccVersion", the first line the C compiler
+// prints for --version, or "" if it prints none.
+func cgoSettings(ctx context.Context, env map[string]string) map[string]string {
+	settings := map[string]string{}
+	for _, v := range cgoVars {
+		settings[v] = env[v]
+	}
+	if cc := strings.Fields(env["CC"]); len(cc) > 0 {
+		out, _ := exec.CommandContext(ctx, cc[0], append(cc[1:], "--version")...).Output()
+		first, _, _ := strings.Cut(string(out), "\n")
+		settings["ccVersion"] = strings.TrimSpace(first)
+	}
+	return settings
 }
 
 func readManifest(dir string) (*manifest, error) {

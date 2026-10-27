@@ -62,6 +62,9 @@ func writeManifestDir(ctx context.Context, out string, args []string) error {
 		BuildTags: nonNil(buildTags(append(goflags, flags...))),
 		Packages:  map[string]manifestEntry{},
 	}
+	if m.CgoEnabled {
+		m.Cgo = cgoSettings(ctx, env)
+	}
 	dec := json.NewDecoder(&stdout)
 	for {
 		var p struct {

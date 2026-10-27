@@ -131,10 +131,12 @@ func TestServesFilesAndExportData(t *testing.T) {
 		}
 	}
 	if !sawVariant {
-		t.Error("the test variant of helper is not a dependency; the fixture no longer covers compiling one")
+		t.Error("the test variant of helper is not a dependency; the fixture no longer covers serving one")
 	}
-	if rep.Prebuilt == 0 || rep.Compiled == 0 || rep.TestsCompiled == 0 || rep.GoList != 0 || len(rep.Missing) != 0 || len(rep.CompileErrors) != 0 {
-		t.Errorf("report = %+v, want prebuilt and compiled archives only", rep)
+	// The archives have every test variant and cgo's output: the driver
+	// compiles nothing and the go command lists no compiled files.
+	if rep.Prebuilt == 0 || rep.Compiled != 0 || rep.TestsCompiled == 0 || rep.GoList != 0 || len(rep.Missing) != 0 || len(rep.CompileErrors) != 0 || rep.ListedCompiled {
+		t.Errorf("report = %+v, want prebuilt archives only", rep)
 	}
 }
 
