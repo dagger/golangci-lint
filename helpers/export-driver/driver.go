@@ -44,6 +44,9 @@ type report struct {
 	// CompileErrors are packages this driver failed to compile, which
 	// fell back to the go command.
 	CompileErrors []string `json:"compileErrors,omitempty"`
+	// ListedCompiled is set when the manifest didn't give every package's
+	// compiled files, so the go command listed them, running cgo.
+	ListedCompiled bool `json:"listedCompiled,omitempty"`
 }
 
 func runDriver(ctx context.Context, patterns []string, stdin io.Reader, stdout io.Writer) error {
@@ -133,8 +136,10 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 		return declined("linter Go version: " + err.Error())
 	}
 
-	mode := req.Mode&^packages.NeedExportFile |
-		packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
+	// The packages' compiled files come from the manifest, which saves the
+	// go command running cgo for every cgo package; unless it misses one.
+	mode := req.Mode&^(packages.NeedExportFile|packages.NeedCompiledGoFiles) |
+		packages.NeedName | packages.NeedFiles |
 		packages.NeedImports | packages.NeedDeps | packages.NeedModule | packages.NeedEmbedFiles | packages.NeedEmbedPatterns
 	cfg := &packages.Config{
 		Context:    ctx,
@@ -146,6 +151,14 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 	roots, err := packages.Load(cfg, patterns...)
 	if err != nil {
 		return nil, report{}, err
+	}
+	listedCompiled := false
+	if !compiledFromManifest(m, dir, roots) {
+		cfg.Mode |= packages.NeedCompiledGoFiles
+		if roots, err = packages.Load(cfg, patterns...); err != nil {
+			return nil, report{}, err
+		}
+		listedCompiled = true
 	}
 
 	// Through a driver the caller loses Module, so it type-checks with the
@@ -160,7 +173,7 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 		}
 	}
 
-	rep := report{Roots: len(roots)}
+	rep := report{Roots: len(roots), ListedCompiled: listedCompiled}
 	if req.Mode&packages.NeedExportFile != 0 {
 		if err := assignExportData(ctx, cfg, m, dir, roots, &rep); err != nil {
 			return nil, report{}, err
@@ -179,6 +192,41 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 		resp.Roots = append(resp.Roots, r.ID)
 	}
 	return resp, rep, nil
+}
+
+// compiledFromManifest sets each package's compiled Go files as the go
+// command would list them, and reports whether it could for all of them. A
+// package in the manifest compiles its Go files, or for a cgo package its
+// other Go files and cgo's output in the manifest's directory. A package
+// with no Go files, unsafe and a test main, whose _testmain.go has no cgo,
+// compile their Go files too. Any other package may use cgo, which only the
+// go command can tell.
+func compiledFromManifest(m *manifest, dir string, roots []*packages.Package) bool {
+	ok := true
+	packages.Visit(roots, nil, func(p *packages.Package) {
+		e, listed := m.Packages[p.ID]
+		switch {
+		case listed && len(e.CgoOutput) > 0:
+			cgo := map[string]bool{}
+			for _, f := range e.CgoFiles {
+				cgo[filepath.Join(p.Dir, f)] = true
+			}
+			p.CompiledGoFiles = nil
+			for _, g := range p.GoFiles {
+				if !cgo[g] {
+					p.CompiledGoFiles = append(p.CompiledGoFiles, g)
+				}
+			}
+			for _, o := range e.CgoOutput {
+				p.CompiledGoFiles = append(p.CompiledGoFiles, filepath.Join(dir, filepath.FromSlash(o)))
+			}
+		case listed, len(p.GoFiles) == 0, p.PkgPath == "unsafe", isTestMain(p):
+			p.CompiledGoFiles = slices.Clone(p.GoFiles)
+		default:
+			ok = false
+		}
+	})
+	return ok
 }
 
 // unsupportedBuildFlags rejects build flags that change what gets compiled

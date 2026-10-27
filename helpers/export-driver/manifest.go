@@ -17,11 +17,13 @@ import (
 )
 
 // manifestVersion is the only manifest layout this driver reads.
-const manifestVersion = 1
+const manifestVersion = 2
 
 // manifest describes a directory of prebuilt per-package archives: the full
 // output of `go tool compile -pack` (export data and object code) for each
-// package, with the settings they were compiled with.
+// package, test variants included, with the settings they were compiled
+// with. Packages are keyed by their ID as go list -test names them: the
+// import path, or "p [p.test]" for a variant compiled for p's test.
 type manifest struct {
 	Version    int                      `json:"version"`
 	GoVersion  string                   `json:"goVersion"`
@@ -37,6 +39,12 @@ type manifestEntry struct {
 	Archive string `json:"archive"`
 	// Sources is sourcesDigest of what the archive was compiled from.
 	Sources string `json:"sources"`
+	// CgoFiles, for a cgo package, are its cgo files' names, relative to
+	// the package directory, and CgoOutput the Go files cgo wrote for its
+	// compile, relative to the manifest's directory, in the compile's order:
+	// the package compiles its other Go files and those.
+	CgoFiles  []string `json:"cgoFiles,omitempty"`
+	CgoOutput []string `json:"cgoOutput,omitempty"`
 }
 
 func readManifest(dir string) (*manifest, error) {
@@ -90,12 +98,12 @@ func (f packageFiles) usesCgo() bool {
 // over the sorted lines "<name> <sha256 of content>\n". It covers the Go
 // files, the other source files and the embedded files, each named by its
 // path relative to the package directory. A cgo package is compiled from
-// cgo's output as well as its plain Go files, and cgo's output, not the
-// sources, is what depends on the C toolchain, headers and flags, so it
-// covers that output instead of the cgo files. The go command names cgo's
-// output files after a hash of their contents, and their //line directives
-// name the directory cgo ran in, so they are named by their position among
-// the generated files and hashed without those directives.
+// cgo's output as well as its plain Go files, and cgo's output is what
+// depends on the C toolchain, headers and flags, so it covers that output as
+// well as the cgo files. The go command names cgo's output files after a
+// hash of their contents, and their //line directives name the directory
+// cgo ran in, so they are named by their position among the generated files
+// and hashed without those directives.
 func sourcesDigest(f packageFiles) (string, error) {
 	var lines []string
 	add := func(name, path string, generated bool) error {
@@ -117,6 +125,17 @@ func sourcesDigest(f packageFiles) (string, error) {
 		plain := map[string]bool{}
 		for _, g := range f.GoFiles {
 			plain[g] = true
+		}
+		compiled := map[string]bool{}
+		for _, c := range f.CompiledGoFiles {
+			compiled[c] = true
+		}
+		for _, g := range f.GoFiles {
+			if !compiled[g] {
+				if err := add(rel(g), g, false); err != nil {
+					return "", err
+				}
+			}
 		}
 		generated := 0
 		for _, c := range f.CompiledGoFiles {

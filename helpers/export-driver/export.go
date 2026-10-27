@@ -24,11 +24,12 @@ import (
 // export data when a package it does analyze imports it.
 //
 // Each package gets, in order of preference:
-//  1. its prebuilt archive, if the archive's sources match the package's and
-//     every package it imports also uses its prebuilt archive;
+//  1. its prebuilt archive, test variants included, if the archive's sources
+//     match the package's and every package it imports also uses its
+//     prebuilt archive;
 //  2. an archive this driver compiles with `go tool compile`, against the
-//     archives of its imports (test variants such as "q [p.test]", and any
-//     other package without non-Go files);
+//     archives of its imports, for a package without non-Go files that has
+//     no matching prebuilt archive;
 //  3. the export data `go list -export` builds, as without the driver.
 func assignExportData(ctx context.Context, cfg *packages.Config, m *manifest, dir string, roots []*packages.Package, rep *report) error {
 	var all []*packages.Package
@@ -62,7 +63,7 @@ func assignExportData(ctx context.Context, cfg *packages.Config, m *manifest, di
 	}
 	for _, p := range all {
 		if p.PkgPath != "unsafe" && verify(p) {
-			archive[p] = absArchive(dir, m.Packages[p.PkgPath].Archive)
+			archive[p] = absArchive(dir, m.Packages[p.ID].Archive)
 		}
 	}
 
@@ -198,11 +199,10 @@ func assignExportData(ctx context.Context, cfg *packages.Config, m *manifest, di
 	return nil
 }
 
+// verifyPrebuilt reports whether the manifest has an archive for p, by its
+// ID, test variants included, compiled from p's sources as they are.
 func verifyPrebuilt(m *manifest, dir string, p *packages.Package) bool {
-	if p.ID != p.PkgPath {
-		return false // a test variant: compiled against test files
-	}
-	entry, ok := m.Packages[p.PkgPath]
+	entry, ok := m.Packages[p.ID]
 	if !ok || entry.Archive == "" || entry.Sources == "" {
 		return false
 	}

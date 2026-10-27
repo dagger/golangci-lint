@@ -16,8 +16,9 @@ import (
 
 // writeManifestDir writes an archives directory for the packages the
 // patterns need, with their tests, from `go list -export`: the layout a
-// per-package builder provides, for tests and comparisons. Test variants are
-// left out, as a builder of plain packages has none.
+// per-package builder provides, for tests and comparisons. It has every
+// package go list compiles, test variants included, but the test mains, and
+// a copy of cgo's output for each cgo package.
 func writeManifestDir(ctx context.Context, out string, args []string) error {
 	var flags, patterns []string
 	for i, a := range args {
@@ -74,7 +75,7 @@ func writeManifestDir(ctx context.Context, out string, args []string) error {
 		} else if err != nil {
 			return err
 		}
-		if p.Export == "" || p.ForTest != "" || strings.Contains(p.ImportPath, " [") || strings.HasSuffix(p.ImportPath, ".test") {
+		if p.Export == "" || strings.HasSuffix(p.ImportPath, ".test") {
 			continue
 		}
 		abs := func(groups ...[]string) []string {
@@ -101,11 +102,34 @@ func writeManifestDir(ctx context.Context, out string, args []string) error {
 			return err
 		}
 		name := sha256.Sum256([]byte(p.ImportPath))
-		rel := filepath.Join("archives", hex.EncodeToString(name[:8])+"-"+filepath.Base(p.ImportPath)+".a")
+		path, _, _ := strings.Cut(p.ImportPath, " [")
+		rel := filepath.Join("archives", hex.EncodeToString(name[:8])+"-"+filepath.Base(path)+".a")
 		if err := copyFile(p.Export, filepath.Join(out, rel)); err != nil {
 			return err
 		}
-		m.Packages[p.ImportPath] = manifestEntry{Archive: filepath.ToSlash(rel), Sources: digest}
+		entry := manifestEntry{Archive: filepath.ToSlash(rel), Sources: digest}
+		if len(p.CgoFiles) > 0 {
+			entry.CgoFiles = p.CgoFiles
+			plain := map[string]bool{}
+			for _, g := range abs(p.GoFiles) {
+				plain[g] = true
+			}
+			cgoDir := filepath.Join("cgo", hex.EncodeToString(name[:8]))
+			if err := os.MkdirAll(filepath.Join(out, cgoDir), 0o755); err != nil {
+				return err
+			}
+			for _, c := range abs(p.CompiledGoFiles) {
+				if plain[c] {
+					continue
+				}
+				o := filepath.Join(cgoDir, filepath.Base(c))
+				if err := copyFile(c, filepath.Join(out, o)); err != nil {
+					return err
+				}
+				entry.CgoOutput = append(entry.CgoOutput, filepath.ToSlash(o))
+			}
+		}
+		m.Packages[p.ImportPath] = entry
 	}
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
