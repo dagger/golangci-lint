@@ -139,7 +139,10 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 
 	// The packages' compiled files come from the manifest, which saves the
 	// go command running cgo for every cgo package; unless it misses one.
-	mode := req.Mode&^(packages.NeedExportFile|packages.NeedCompiledGoFiles) |
+	// go/packages lists compiled files for any of the modes that type-check,
+	// which the caller does itself, from what this driver answers.
+	mode := req.Mode&^(packages.NeedExportFile|packages.NeedCompiledGoFiles|
+		packages.NeedSyntax|packages.NeedTypes|packages.NeedTypesInfo|packages.NeedTypesSizes) |
 		packages.NeedName | packages.NeedFiles |
 		packages.NeedImports | packages.NeedDeps | packages.NeedModule | packages.NeedEmbedFiles | packages.NeedEmbedPatterns
 	cfg := &packages.Config{
