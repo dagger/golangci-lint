@@ -51,6 +51,22 @@ type manifestEntry struct {
 	// the package compiles its other Go files and those.
 	CgoFiles  []string `json:"cgoFiles,omitempty"`
 	CgoOutput []string `json:"cgoOutput,omitempty"`
+	// Module, for a cgo package, is the module version its files come from,
+	// "path@version" (moduleVersion), or "" for the main module's or a local
+	// replacement's: what its C compiles may read beyond its digest.
+	Module string `json:"module,omitempty"`
+}
+
+// moduleVersion is the module version a package's files come from, the
+// replacement's if any, "path@version", or "" for files no version fixes.
+func moduleVersion(m *packages.Module) string {
+	if m != nil && m.Replace != nil {
+		m = m.Replace
+	}
+	if m == nil || m.Version == "" {
+		return ""
+	}
+	return m.Path + "@" + m.Version
 }
 
 // cgoVars are the go command's settings cgo's output depends on.

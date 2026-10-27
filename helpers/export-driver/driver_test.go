@@ -524,6 +524,32 @@ func TestStaleCgoEntryListsCompiledFiles(t *testing.T) {
 	}
 }
 
+// TestFixedContent checks which cgo packages the archives' cgo output is
+// used for: the standard library's, and a module version's from the module
+// cache that the archives were made from, never a changed version's, a
+// vendored copy's, a local replacement's or the main module's.
+func TestFixedContent(t *testing.T) {
+	cache := "/go/pkg/mod"
+	dep := &packages.Module{Path: "example.com/dep", Version: "v1.0.0"}
+	for _, c := range []struct {
+		name string
+		p    *packages.Package
+		e    manifestEntry
+		want bool
+	}{
+		{"standard library", &packages.Package{Dir: "/usr/local/go/src/net"}, manifestEntry{}, true},
+		{"same version", &packages.Package{Module: dep, Dir: cache + "/example.com/dep@v1.0.0/c"}, manifestEntry{Module: "example.com/dep@v1.0.0"}, true},
+		{"other version", &packages.Package{Module: dep, Dir: cache + "/example.com/dep@v1.0.0/c"}, manifestEntry{Module: "example.com/dep@v0.9.0"}, false},
+		{"vendored", &packages.Package{Module: dep, Dir: "/src/vendor/example.com/dep/c"}, manifestEntry{Module: "example.com/dep@v1.0.0"}, false},
+		{"local replacement", &packages.Package{Module: &packages.Module{Path: "example.com/dep", Version: "v1.0.0", Replace: &packages.Module{Path: "../dep"}}, Dir: "/src/dep/c"}, manifestEntry{}, false},
+		{"main module", &packages.Package{Module: &packages.Module{Path: "example.com/m", Main: true}, Dir: "/src/c"}, manifestEntry{}, false},
+	} {
+		if got := fixedContent(c.p, c.e, cache); got != c.want {
+			t.Errorf("%s: fixedContent = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 // TestCgoHeaderOutsideThePackage checks that a cgo package of the main module
 // is never served with the archives' cgo output, which a header outside its
 // directory, not in its digest, may have changed: the go command runs cgo

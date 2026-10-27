@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/tools/go/packages"
 )
 
 // writeManifestDir writes an archives directory for the packages the
@@ -39,7 +41,7 @@ func writeManifestDir(ctx context.Context, out string, args []string) error {
 		return fmt.Errorf("GOFLAGS: %w", err)
 	}
 	listArgs := append([]string{"list", "-e", "-export", "-compiled", "-deps", "-test",
-		"-json=ImportPath,ForTest,Dir,Export,GoFiles,CgoFiles,CompiledGoFiles,EmbedFiles,CFiles,CXXFiles,HFiles,SFiles,MFiles,FFiles,SwigFiles,SwigCXXFiles,SysoFiles"},
+		"-json=ImportPath,ForTest,Dir,Module,Export,GoFiles,CgoFiles,CompiledGoFiles,EmbedFiles,CFiles,CXXFiles,HFiles,SFiles,MFiles,FFiles,SwigFiles,SwigCXXFiles,SysoFiles"},
 		flags...)
 	listArgs = append(listArgs, "--")
 	listArgs = append(listArgs, patterns...)
@@ -69,6 +71,7 @@ func writeManifestDir(ctx context.Context, out string, args []string) error {
 	for {
 		var p struct {
 			ImportPath, ForTest, Dir, Export                 string
+			Module                                           *packages.Module
 			GoFiles, CgoFiles, CompiledGoFiles, EmbedFiles   []string
 			CFiles, CXXFiles, HFiles, SFiles, MFiles, FFiles []string
 			SwigFiles, SwigCXXFiles, SysoFiles               []string
@@ -113,6 +116,7 @@ func writeManifestDir(ctx context.Context, out string, args []string) error {
 		entry := manifestEntry{Archive: filepath.ToSlash(rel), Sources: digest}
 		if len(p.CgoFiles) > 0 {
 			entry.CgoFiles = p.CgoFiles
+			entry.Module = moduleVersion(p.Module)
 			plain := map[string]bool{}
 			for _, g := range abs(p.GoFiles) {
 				plain[g] = true

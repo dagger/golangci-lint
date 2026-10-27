@@ -172,7 +172,7 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 		}
 	}
 	listedCompiled := false
-	if !compiledFromManifest(m, dir, roots, cgoImports, cgoMatches) || !cgoOutputMatches(m, dir, roots) {
+	if !compiledFromManifest(m, dir, roots, cgoImports, cgoMatches, env["GOMODCACHE"]) || !cgoOutputMatches(m, dir, roots) {
 		cfg.Mode |= packages.NeedCompiledGoFiles
 		if roots, err = packages.Load(cfg, patterns...); err != nil {
 			return nil, report{}, err
@@ -225,7 +225,7 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 // and syscall, which the go command lists among a cgo package's imports only
 // when it lists the compiled files: they are added from the packages loaded,
 // roots' or extra's, one package for each ID.
-func compiledFromManifest(m *manifest, dir string, roots, extra []*packages.Package, cgoMatches bool) bool {
+func compiledFromManifest(m *manifest, dir string, roots, extra []*packages.Package, cgoMatches bool, modcache string) bool {
 	byID := map[string]*packages.Package{}
 	packages.Visit(roots, nil, func(p *packages.Package) { byID[p.ID] = p })
 	packages.Visit(extra, nil, func(p *packages.Package) {
@@ -255,7 +255,7 @@ func compiledFromManifest(m *manifest, dir string, roots, extra []*packages.Pack
 		done[p] = true
 		e, listed := m.Packages[p.ID]
 		switch {
-		case listed && len(e.CgoOutput) > 0 && (!cgoMatches || !fixedContent(p)):
+		case listed && len(e.CgoOutput) > 0 && (!cgoMatches || !fixedContent(p, e, modcache)):
 			ok = false
 		case listed && len(e.CgoOutput) > 0:
 			cgo := map[string]bool{}
@@ -301,14 +301,19 @@ func cgoOutputMatches(m *manifest, dir string, roots []*packages.Package) bool {
 }
 
 // fixedContent reports whether what a cgo package's C compiles read, which
-// can be any file of its module, is fixed by what identifies its module:
-// the standard library, by the Go version, or a module version, by its
-// checksum. A package of the main module or of a local replacement can
-// include headers that its digest doesn't cover, so the go command runs cgo
-// for it afresh.
-func fixedContent(p *packages.Package) bool {
-	m := p.Module
-	return m == nil || !m.Main && (m.Replace == nil || m.Replace.Version != "")
+// can be any file of its module, is fixed by what identifies it and is the
+// same as the archives': the standard library's, by the Go version, or a
+// module version's in the module cache, by its checksum, if the archives
+// were made from that version. A package of the main module, of a local
+// replacement or of a vendor directory can include files its digest
+// doesn't cover, so the go command runs cgo for it afresh.
+func fixedContent(p *packages.Package, e manifestEntry, modcache string) bool {
+	if p.Module == nil {
+		return true
+	}
+	v := moduleVersion(p.Module)
+	rel, err := filepath.Rel(modcache, p.Dir)
+	return !p.Module.Main && v != "" && v == e.Module && modcache != "" && err == nil && !strings.HasPrefix(rel, "..")
 }
 
 // addImports adds to p's imports the packages file imports that p's don't
@@ -373,7 +378,7 @@ func nonNil(s []string) []string {
 }
 
 func goEnv(ctx context.Context, env []string) (map[string]string, error) {
-	cmd := exec.CommandContext(ctx, "go", append([]string{"env", "-json", "GOVERSION", "GOOS", "GOARCH", "CGO_ENABLED", "GOFLAGS"}, cgoVars...)...)
+	cmd := exec.CommandContext(ctx, "go", append([]string{"env", "-json", "GOVERSION", "GOOS", "GOARCH", "CGO_ENABLED", "GOFLAGS", "GOMODCACHE"}, cgoVars...)...)
 	cmd.Env = env
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
