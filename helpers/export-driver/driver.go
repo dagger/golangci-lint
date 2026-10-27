@@ -6,6 +6,8 @@ import (
 	"debug/buildinfo"
 	"encoding/json"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"io"
 	"maps"
 	"os"
@@ -159,8 +161,18 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 	// cgo's output in the archives is good only for the C settings it was
 	// made with; with others, the go command lists cgo's output afresh.
 	cgoMatches := m.CgoEnabled && maps.Equal(m.Cgo, cgoSettings(ctx, env))
+	// cgo's output imports packages, such as runtime/cgo, that the go
+	// command leaves out of the listing unless it lists compiled files.
+	var cgoImports []*packages.Package
+	if cgoMatches {
+		plain := *cfg
+		plain.Tests = false
+		if cgoImports, err = packages.Load(&plain, "runtime/cgo", "syscall"); err != nil {
+			return nil, report{}, err
+		}
+	}
 	listedCompiled := false
-	if !compiledFromManifest(m, dir, roots, cgoMatches) {
+	if !compiledFromManifest(m, dir, roots, cgoImports, cgoMatches) {
 		cfg.Mode |= packages.NeedCompiledGoFiles
 		if roots, err = packages.Load(cfg, patterns...); err != nil {
 			return nil, report{}, err
@@ -208,9 +220,39 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 // directory. A package with no Go files, unsafe and a test main, whose
 // _testmain.go has no cgo, compile their Go files too. Any other package may
 // use cgo, which only the go command can tell.
-func compiledFromManifest(m *manifest, dir string, roots []*packages.Package, cgoMatches bool) bool {
+//
+// cgo's output imports packages the cgo files don't, such as runtime/cgo
+// and syscall, which the go command lists among a cgo package's imports only
+// when it lists the compiled files: they are added from the packages loaded,
+// roots' or extra's, one package for each ID.
+func compiledFromManifest(m *manifest, dir string, roots, extra []*packages.Package, cgoMatches bool) bool {
+	byID := map[string]*packages.Package{}
+	packages.Visit(roots, nil, func(p *packages.Package) { byID[p.ID] = p })
+	packages.Visit(extra, nil, func(p *packages.Package) {
+		for path, imp := range p.Imports {
+			p.Imports[path] = byID[imp.ID]
+		}
+		if _, ok := byID[p.ID]; !ok {
+			byID[p.ID] = p
+		}
+	})
+	byPath := map[string]*packages.Package{}
+	for id, p := range byID {
+		if id == p.PkgPath {
+			byPath[id] = p
+		}
+	}
+	// Every package reached from the roots, through the imports added too.
 	ok := true
-	packages.Visit(roots, nil, func(p *packages.Package) {
+	done := map[*packages.Package]bool{}
+	queue := slices.Clone(roots)
+	for len(queue) > 0 {
+		p := queue[0]
+		queue = queue[1:]
+		if done[p] {
+			continue
+		}
+		done[p] = true
 		e, listed := m.Packages[p.ID]
 		switch {
 		case listed && len(e.CgoOutput) > 0 && !cgoMatches:
@@ -227,15 +269,50 @@ func compiledFromManifest(m *manifest, dir string, roots []*packages.Package, cg
 				}
 			}
 			for _, o := range e.CgoOutput {
-				p.CompiledGoFiles = append(p.CompiledGoFiles, filepath.Join(dir, filepath.FromSlash(o)))
+				out := filepath.Join(dir, filepath.FromSlash(o))
+				p.CompiledGoFiles = append(p.CompiledGoFiles, out)
+				if !addImports(p, out, byPath) {
+					ok = false
+				}
 			}
 		case listed, len(p.GoFiles) == 0, p.PkgPath == "unsafe", isTestMain(p):
 			p.CompiledGoFiles = slices.Clone(p.GoFiles)
 		default:
 			ok = false
 		}
-	})
+		for _, imp := range p.Imports {
+			queue = append(queue, imp)
+		}
+	}
 	return ok
+}
+
+// addImports adds to p's imports the packages file imports that p's don't
+// have, from byPath, and reports whether it found them all. C is cgo's, no
+// package.
+func addImports(p *packages.Package, file string, byPath map[string]*packages.Package) bool {
+	f, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.ImportsOnly)
+	if err != nil {
+		return false
+	}
+	for _, spec := range f.Imports {
+		path, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			return false
+		}
+		if _, ok := p.Imports[path]; ok || path == "C" {
+			continue
+		}
+		imp, ok := byPath[path]
+		if !ok {
+			return false
+		}
+		if p.Imports == nil {
+			p.Imports = map[string]*packages.Package{}
+		}
+		p.Imports[path] = imp
+	}
+	return true
 }
 
 // unsupportedBuildFlags rejects build flags that change what gets compiled

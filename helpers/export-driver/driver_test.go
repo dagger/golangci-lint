@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -434,6 +437,36 @@ func TestCgoFlagsChangeArchive(t *testing.T) {
 	}
 	if got := packageByID(t, resp, "example.com/m/cval").ExportFile; got == prebuilt || got == "" {
 		t.Errorf("after the C flags changed, cval's export data = %q, want a fresh archive", got)
+	}
+}
+
+// TestCgoOutputImportsAreImports checks that a cgo package served with the
+// archives' copy of cgo's output imports what that output imports, such as
+// runtime/cgo and syscall, which the cgo files themselves don't: without
+// them, golangci-lint can't type-check the package.
+func TestCgoOutputImportsAreImports(t *testing.T) {
+	if _, err := exec.LookPath("gcc"); err != nil {
+		t.Skip("no C compiler")
+	}
+	t.Setenv("CGO_ENABLED", "1")
+	mod := writeModule(t, toolchainLang())
+	writeCgoModule(t, mod, "plain")
+	resp, rep := serveModule(t, mod, archivesFor(t, mod), nil)
+	if resp.NotHandled || rep.ListedCompiled {
+		t.Fatalf("not served from the archives: %+v", rep)
+	}
+	p := packageByID(t, resp, "example.com/m/cval")
+	for _, f := range p.CompiledGoFiles {
+		file, err := parser.ParseFile(token.NewFileSet(), f, nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, spec := range file.Imports {
+			path, _ := strconv.Unquote(spec.Path.Value)
+			if _, ok := p.Imports[path]; !ok && path != "C" {
+				t.Errorf("%s imports %s, which cval's imports lack", filepath.Base(f), path)
+			}
+		}
 	}
 }
 
