@@ -440,6 +440,19 @@ func TestCgoFlagsChangeArchive(t *testing.T) {
 	}
 }
 
+// writeStdCgoModule adds a package that imports os/user, a standard library
+// package that uses cgo when cgo is on, whose content the Go version fixes:
+// the driver serves it with the archives' copy of cgo's output.
+func writeStdCgoModule(t *testing.T) string {
+	t.Helper()
+	t.Setenv("CGO_ENABLED", "1")
+	mod := writeModule(t, toolchainLang())
+	writeFiles(t, mod, map[string]string{
+		"who/who.go": "// Package who names the user.\npackage who\n\nimport \"os/user\"\n\n// Name is the user's name.\nfunc Name() string { u, _ := user.Current(); return u.Username }\n",
+	})
+	return mod
+}
+
 // TestCgoOutputImportsAreImports checks that a cgo package served with the
 // archives' copy of cgo's output imports what that output imports, such as
 // runtime/cgo and syscall, which the cgo files themselves don't: without
@@ -448,14 +461,19 @@ func TestCgoOutputImportsAreImports(t *testing.T) {
 	if _, err := exec.LookPath("gcc"); err != nil {
 		t.Skip("no C compiler")
 	}
-	t.Setenv("CGO_ENABLED", "1")
-	mod := writeModule(t, toolchainLang())
-	writeCgoModule(t, mod, "plain")
-	resp, rep := serveModule(t, mod, archivesFor(t, mod), nil)
+	mod := writeStdCgoModule(t)
+	archives := archivesFor(t, mod)
+	if m, err := readManifest(archives); err != nil || len(m.Packages["os/user"].CgoOutput) == 0 {
+		t.Fatalf("os/user doesn't use cgo here: %v", err)
+	}
+	resp, rep := serveModule(t, mod, archives, nil)
 	if resp.NotHandled || rep.ListedCompiled {
 		t.Fatalf("not served from the archives: %+v", rep)
 	}
-	p := packageByID(t, resp, "example.com/m/cval")
+	p := packageByID(t, resp, "os/user")
+	if p.ExportFile != manifestArchive(t, archives, "os/user") {
+		t.Errorf("os/user's export data = %q, want its archive", p.ExportFile)
+	}
 	for _, f := range p.CompiledGoFiles {
 		file, err := parser.ParseFile(token.NewFileSet(), f, nil, parser.ImportsOnly)
 		if err != nil {
@@ -464,9 +482,74 @@ func TestCgoOutputImportsAreImports(t *testing.T) {
 		for _, spec := range file.Imports {
 			path, _ := strconv.Unquote(spec.Path.Value)
 			if _, ok := p.Imports[path]; !ok && path != "C" {
-				t.Errorf("%s imports %s, which cval's imports lack", filepath.Base(f), path)
+				t.Errorf("%s imports %s, which os/user's imports lack", filepath.Base(f), path)
 			}
 		}
+	}
+}
+
+// TestStaleCgoEntryListsCompiledFiles checks that when a cgo package served
+// with the archives' copy of cgo's output wasn't compiled from its sources
+// as they are, the go command lists compiled files afresh, so the package's
+// fresh export data comes with cgo's fresh output.
+func TestStaleCgoEntryListsCompiledFiles(t *testing.T) {
+	if _, err := exec.LookPath("gcc"); err != nil {
+		t.Skip("no C compiler")
+	}
+	mod := writeStdCgoModule(t)
+	archives := archivesFor(t, mod)
+	path := filepath.Join(archives, "manifest.json")
+	m, err := readManifest(archives)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := m.Packages["os/user"]
+	e.Sources = "sha256:stale"
+	m.Packages["os/user"] = e
+	data, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resp, rep := serveModule(t, mod, archives, nil)
+	if resp.NotHandled || !rep.ListedCompiled {
+		t.Fatalf("a stale cgo entry didn't make the go command list compiled files: %+v", rep)
+	}
+	for _, f := range packageByID(t, resp, "os/user").CompiledGoFiles {
+		if strings.HasPrefix(f, archives) {
+			t.Errorf("os/user compiles the archives' stale cgo output %s", f)
+		}
+	}
+}
+
+// TestCgoHeaderOutsideThePackage checks that a cgo package of the main module
+// is never served with the archives' cgo output, which a header outside its
+// directory, not in its digest, may have changed: the go command runs cgo
+// for it, as without the driver. The go command doesn't track such a header
+// either, so the lint runs with an empty build cache, as golangci-lint's own
+// go list would need to see the change.
+func TestCgoHeaderOutsideThePackage(t *testing.T) {
+	if _, err := exec.LookPath("gcc"); err != nil {
+		t.Skip("no C compiler")
+	}
+	t.Setenv("CGO_ENABLED", "1")
+	mod := writeModule(t, toolchainLang())
+	writeFiles(t, mod, map[string]string{
+		"native/defs.inc": "#define VALUE 1\n",
+		"cval/cval.go":    "// Package cval exports a C constant.\npackage cval\n\n// #include \"../native/defs.inc\"\nimport \"C\"\n\n// Value is C's VALUE.\nconst Value = C.VALUE\n",
+	})
+	archives := archivesFor(t, mod)
+	prebuilt := manifestArchive(t, archives, "example.com/m/cval")
+	writeFiles(t, mod, map[string]string{"native/defs.inc": "#define VALUE 2\n"})
+	t.Setenv("GOCACHE", t.TempDir())
+	resp, rep := serveModule(t, mod, archives, nil)
+	if resp.NotHandled {
+		t.Fatalf("declined: %s", rep.Declined)
+	}
+	if got := packageByID(t, resp, "example.com/m/cval").ExportFile; got == prebuilt || got == "" {
+		t.Errorf("after a header outside cval changed, its export data = %q, want a fresh archive", got)
 	}
 }
 

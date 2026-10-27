@@ -172,7 +172,7 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 		}
 	}
 	listedCompiled := false
-	if !compiledFromManifest(m, dir, roots, cgoImports, cgoMatches) {
+	if !compiledFromManifest(m, dir, roots, cgoImports, cgoMatches) || !cgoOutputMatches(m, dir, roots) {
 		cfg.Mode |= packages.NeedCompiledGoFiles
 		if roots, err = packages.Load(cfg, patterns...); err != nil {
 			return nil, report{}, err
@@ -216,8 +216,8 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 // compiledFromManifest sets each package's compiled Go files as the go
 // command would list them, and reports whether it could for all of them. A
 // package in the manifest compiles its Go files, or for a cgo package, when
-// cgoMatches, its other Go files and cgo's output in the manifest's
-// directory. A package with no Go files, unsafe and a test main, whose
+// cgoMatches and its content is fixed (fixedContent), its other Go files and
+// cgo's output in the manifest's directory. A package with no Go files, unsafe and a test main, whose
 // _testmain.go has no cgo, compile their Go files too. Any other package may
 // use cgo, which only the go command can tell.
 //
@@ -255,7 +255,7 @@ func compiledFromManifest(m *manifest, dir string, roots, extra []*packages.Pack
 		done[p] = true
 		e, listed := m.Packages[p.ID]
 		switch {
-		case listed && len(e.CgoOutput) > 0 && !cgoMatches:
+		case listed && len(e.CgoOutput) > 0 && (!cgoMatches || !fixedContent(p)):
 			ok = false
 		case listed && len(e.CgoOutput) > 0:
 			cgo := map[string]bool{}
@@ -285,6 +285,30 @@ func compiledFromManifest(m *manifest, dir string, roots, extra []*packages.Pack
 		}
 	}
 	return ok
+}
+
+// cgoOutputMatches reports whether every package given the manifest's copy of
+// cgo's output was compiled from its sources as they are. One that wasn't
+// gets fresh export data, which must be checked against cgo's fresh output.
+func cgoOutputMatches(m *manifest, dir string, roots []*packages.Package) bool {
+	ok := true
+	packages.Visit(roots, nil, func(p *packages.Package) {
+		if e := m.Packages[p.ID]; len(e.CgoOutput) > 0 && !verifyPrebuilt(m, dir, p) {
+			ok = false
+		}
+	})
+	return ok
+}
+
+// fixedContent reports whether what a cgo package's C compiles read, which
+// can be any file of its module, is fixed by what identifies its module:
+// the standard library, by the Go version, or a module version, by its
+// checksum. A package of the main module or of a local replacement can
+// include headers that its digest doesn't cover, so the go command runs cgo
+// for it afresh.
+func fixedContent(p *packages.Package) bool {
+	m := p.Module
+	return m == nil || !m.Main && (m.Replace == nil || m.Replace.Version != "")
 }
 
 // addImports adds to p's imports the packages file imports that p's don't
