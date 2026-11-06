@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -521,6 +522,27 @@ func TestStaleCgoEntryListsCompiledFiles(t *testing.T) {
 		if strings.HasPrefix(f, archives) {
 			t.Errorf("os/user compiles the archives' stale cgo output %s", f)
 		}
+	}
+}
+
+// TestUnlistedPackageWithoutCgo checks that a package the archives lack,
+// such as one written after they were built, doesn't make the go command
+// list compiled files for every package when it uses no cgo: its compiled
+// files are its Go files, and the others keep the archives' cgo output.
+func TestUnlistedPackageWithoutCgo(t *testing.T) {
+	if _, err := exec.LookPath("gcc"); err != nil {
+		t.Skip("no C compiler")
+	}
+	mod := writeStdCgoModule(t)
+	archives := archivesFor(t, mod)
+	writeFiles(t, mod, map[string]string{"later/later.go": "// Package later came after the archives.\npackage later\n\nimport _ \"example.com/m/who\"\n"})
+	resp, rep := serveModule(t, mod, archives, nil)
+	if resp.NotHandled || rep.ListedCompiled {
+		t.Fatalf("a package without cgo the archives lack made the go command list compiled files: %+v", rep)
+	}
+	p := packageByID(t, resp, "example.com/m/later")
+	if !slices.Equal(p.CompiledGoFiles, p.GoFiles) {
+		t.Errorf("later compiles %v, want its Go files %v", p.CompiledGoFiles, p.GoFiles)
 	}
 }
 

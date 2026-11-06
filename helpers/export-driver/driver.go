@@ -217,9 +217,11 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 // command would list them, and reports whether it could for all of them. A
 // package in the manifest compiles its Go files, or for a cgo package, when
 // cgoMatches and its content is fixed (fixedContent), its other Go files and
-// cgo's output in the manifest's directory. A package with no Go files, unsafe and a test main, whose
-// _testmain.go has no cgo, compile their Go files too. Any other package may
-// use cgo, which only the go command can tell.
+// cgo's output in the manifest's directory. A package with no Go files,
+// unsafe and a test main, whose _testmain.go has no cgo, compile their Go
+// files too, as does any other package none of whose Go files imports "C":
+// that is how the go command tells a cgo package. Only a cgo package the
+// manifest lacks needs the go command to list what cgo writes for it.
 //
 // cgo's output imports packages the cgo files don't, such as runtime/cgo
 // and syscall, which the go command lists among a cgo package's imports only
@@ -275,7 +277,7 @@ func compiledFromManifest(m *manifest, dir string, roots, extra []*packages.Pack
 					ok = false
 				}
 			}
-		case listed, len(p.GoFiles) == 0, p.PkgPath == "unsafe", isTestMain(p):
+		case listed, len(p.GoFiles) == 0, p.PkgPath == "unsafe", isTestMain(p), !importsC(p.GoFiles) && !hasSwig(p.OtherFiles):
 			p.CompiledGoFiles = slices.Clone(p.GoFiles)
 		default:
 			ok = false
@@ -298,6 +300,34 @@ func cgoOutputMatches(m *manifest, dir string, roots []*packages.Package) bool {
 		}
 	})
 	return ok
+}
+
+// importsC reports whether any of files imports "C", or can't be read to
+// tell.
+func importsC(files []string) bool {
+	for _, f := range files {
+		file, err := parser.ParseFile(token.NewFileSet(), f, nil, parser.ImportsOnly)
+		if err != nil {
+			return true
+		}
+		for _, spec := range file.Imports {
+			if spec.Path.Value == `"C"` {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasSwig reports whether a package has SWIG files, which make it use cgo
+// too.
+func hasSwig(files []string) bool {
+	for _, f := range files {
+		if strings.HasSuffix(f, ".swig") || strings.HasSuffix(f, ".swigcxx") {
+			return true
+		}
+	}
+	return false
 }
 
 // fixedContent reports whether what a cgo package's C compiles read, which
