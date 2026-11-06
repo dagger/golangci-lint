@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/dagger/golangci-lint/helpers/export-driver/manifest"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -110,7 +111,7 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 	if reason := unsupportedBuildFlags(req.BuildFlags); reason != "" {
 		return declined(reason)
 	}
-	m, err := readManifest(dir)
+	m, err := manifest.Read(dir)
 	if err != nil {
 		return declined("manifest: " + err.Error())
 	}
@@ -164,7 +165,7 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 	}
 	// cgo's output in the archives is good only for the C settings it was
 	// made with; with others, the go command lists cgo's output afresh.
-	cgoMatches := m.CgoEnabled && maps.Equal(m.Cgo, cgoSettings(ctx, env))
+	cgoMatches := m.CgoEnabled && maps.Equal(m.Cgo, manifest.CgoSettings(ctx, env))
 	// cgo's output imports packages, such as runtime/cgo, that the go
 	// command leaves out of the listing unless it lists compiled files.
 	var cgoImports []*packages.Package
@@ -231,7 +232,7 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 // and syscall, which the go command lists among a cgo package's imports only
 // when it lists the compiled files: they are added from the packages loaded,
 // roots' or extra's, one package for each ID.
-func compiledFromManifest(m *manifest, dir string, roots, extra []*packages.Package, cgoMatches bool, modcache string) bool {
+func compiledFromManifest(m *manifest.Manifest, dir string, roots, extra []*packages.Package, cgoMatches bool, modcache string) bool {
 	byID := map[string]*packages.Package{}
 	packages.Visit(roots, nil, func(p *packages.Package) { byID[p.ID] = p })
 	packages.Visit(extra, nil, func(p *packages.Package) {
@@ -296,7 +297,7 @@ func compiledFromManifest(m *manifest, dir string, roots, extra []*packages.Pack
 // cgoOutputMatches reports whether every package given the manifest's copy of
 // cgo's output was compiled from its sources as they are. One that wasn't
 // gets fresh export data, which must be checked against cgo's fresh output.
-func cgoOutputMatches(m *manifest, dir string, roots []*packages.Package) bool {
+func cgoOutputMatches(m *manifest.Manifest, dir string, roots []*packages.Package) bool {
 	ok := true
 	packages.Visit(roots, nil, func(p *packages.Package) {
 		if e := m.Packages[p.ID]; len(e.CgoOutput) > 0 && !verifyPrebuilt(m, dir, p) {
@@ -341,7 +342,7 @@ func hasSwig(files []string) bool {
 // were made from that version. A package of the main module, of a local
 // replacement or of a vendor directory can include files its digest
 // doesn't cover, so the go command runs cgo for it afresh.
-func fixedContent(p *packages.Package, e manifestEntry, modcache string) bool {
+func fixedContent(p *packages.Package, e manifest.Entry, modcache string) bool {
 	if p.Module == nil {
 		return true
 	}
@@ -412,7 +413,7 @@ func nonNil(s []string) []string {
 }
 
 func goEnv(ctx context.Context, env []string) (map[string]string, error) {
-	cmd := exec.CommandContext(ctx, "go", append([]string{"env", "-json", "GOVERSION", "GOOS", "GOARCH", "CGO_ENABLED", "GOFLAGS", "GOMODCACHE"}, cgoVars...)...)
+	cmd := exec.CommandContext(ctx, "go", append([]string{"env", "-json", "GOFLAGS"}, manifest.EnvVars...)...)
 	cmd.Env = env
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dagger/golangci-lint/helpers/export-driver/manifest"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -149,7 +150,7 @@ func TestServesFilesAndExportData(t *testing.T) {
 func TestStaleArchiveIsNotUsed(t *testing.T) {
 	mod := writeModule(t, toolchainLang())
 	archives := archivesFor(t, mod)
-	var m manifest
+	var m manifest.Manifest
 	data, err := os.ReadFile(filepath.Join(archives, "manifest.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -250,12 +251,12 @@ func TestDeclines(t *testing.T) {
 	mod := writeModule(t, toolchainLang())
 	archives := archivesFor(t, mod)
 
-	editManifest := func(t *testing.T, edit func(*manifest)) string {
+	editManifest := func(t *testing.T, edit func(*manifest.Manifest)) string {
 		data, err := os.ReadFile(filepath.Join(archives, "manifest.json"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		var m manifest
+		var m manifest.Manifest
 		if err := json.Unmarshal(data, &m); err != nil {
 			t.Fatal(err)
 		}
@@ -281,10 +282,10 @@ func TestDeclines(t *testing.T) {
 	}{
 		{name: "no archives", archives: func(*testing.T) string { return "" }},
 		{name: "other toolchain", archives: func(t *testing.T) string {
-			return editManifest(t, func(m *manifest) { m.GoVersion = "go1.1" })
+			return editManifest(t, func(m *manifest.Manifest) { m.GoVersion = "go1.1" })
 		}},
 		{name: "other platform", archives: func(t *testing.T) string {
-			return editManifest(t, func(m *manifest) { m.GOARCH = "other" })
+			return editManifest(t, func(m *manifest.Manifest) { m.GOARCH = "other" })
 		}},
 		{name: "other tags", archives: func(t *testing.T) string { return archives },
 			mutate: func(r *packages.DriverRequest) { r.BuildFlags = []string{"-tags", "extra"} }},
@@ -399,7 +400,7 @@ func writeFiles(t *testing.T, dir string, files map[string]string) {
 
 func manifestArchive(t *testing.T, archives, pkgPath string) string {
 	t.Helper()
-	m, err := readManifest(archives)
+	m, err := manifest.Read(archives)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -525,7 +526,7 @@ func TestCgoOutputImportsAreImports(t *testing.T) {
 	}
 	mod := writeStdCgoModule(t)
 	archives := archivesFor(t, mod)
-	if m, err := readManifest(archives); err != nil || len(m.Packages["os/user"].CgoOutput) == 0 {
+	if m, err := manifest.Read(archives); err != nil || len(m.Packages["os/user"].CgoOutput) == 0 {
 		t.Fatalf("os/user doesn't use cgo here: %v", err)
 	}
 	resp, rep := serveModule(t, mod, archives, nil)
@@ -561,7 +562,7 @@ func TestStaleCgoEntryListsCompiledFiles(t *testing.T) {
 	mod := writeStdCgoModule(t)
 	archives := archivesFor(t, mod)
 	path := filepath.Join(archives, "manifest.json")
-	m, err := readManifest(archives)
+	m, err := manifest.Read(archives)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -617,15 +618,15 @@ func TestFixedContent(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		p    *packages.Package
-		e    manifestEntry
+		e    manifest.Entry
 		want bool
 	}{
-		{"standard library", &packages.Package{Dir: "/usr/local/go/src/net"}, manifestEntry{}, true},
-		{"same version", &packages.Package{Module: dep, Dir: cache + "/example.com/dep@v1.0.0/c"}, manifestEntry{Module: "example.com/dep@v1.0.0"}, true},
-		{"other version", &packages.Package{Module: dep, Dir: cache + "/example.com/dep@v1.0.0/c"}, manifestEntry{Module: "example.com/dep@v0.9.0"}, false},
-		{"vendored", &packages.Package{Module: dep, Dir: "/src/vendor/example.com/dep/c"}, manifestEntry{Module: "example.com/dep@v1.0.0"}, false},
-		{"local replacement", &packages.Package{Module: &packages.Module{Path: "example.com/dep", Version: "v1.0.0", Replace: &packages.Module{Path: "../dep"}}, Dir: "/src/dep/c"}, manifestEntry{}, false},
-		{"main module", &packages.Package{Module: &packages.Module{Path: "example.com/m", Main: true}, Dir: "/src/c"}, manifestEntry{}, false},
+		{"standard library", &packages.Package{Dir: "/usr/local/go/src/net"}, manifest.Entry{}, true},
+		{"same version", &packages.Package{Module: dep, Dir: cache + "/example.com/dep@v1.0.0/c"}, manifest.Entry{Module: "example.com/dep@v1.0.0"}, true},
+		{"other version", &packages.Package{Module: dep, Dir: cache + "/example.com/dep@v1.0.0/c"}, manifest.Entry{Module: "example.com/dep@v0.9.0"}, false},
+		{"vendored", &packages.Package{Module: dep, Dir: "/src/vendor/example.com/dep/c"}, manifest.Entry{Module: "example.com/dep@v1.0.0"}, false},
+		{"local replacement", &packages.Package{Module: &packages.Module{Path: "example.com/dep", Version: "v1.0.0", Replace: &packages.Module{Path: "../dep"}}, Dir: "/src/dep/c"}, manifest.Entry{}, false},
+		{"main module", &packages.Package{Module: &packages.Module{Path: "example.com/m", Main: true}, Dir: "/src/c"}, manifest.Entry{}, false},
 	} {
 		if got := fixedContent(c.p, c.e, cache); got != c.want {
 			t.Errorf("%s: fixedContent = %v, want %v", c.name, got, c.want)
@@ -801,7 +802,7 @@ func TestTagsOnTheCommandLineOverrideGOFLAGS(t *testing.T) {
 	if err := writeManifestDir(context.Background(), out, []string{"-tags=explicit", "--", "./..."}); err != nil {
 		t.Fatal(err)
 	}
-	m, err := readManifest(out)
+	m, err := manifest.Read(out)
 	if err != nil {
 		t.Fatal(err)
 	}

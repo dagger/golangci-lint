@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/dagger/golangci-lint/helpers/export-driver/manifest"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -31,7 +32,7 @@ import (
 //     archives of its imports, for a package without non-Go files that has
 //     no matching prebuilt archive;
 //  3. the export data `go list -export` builds, as without the driver.
-func assignExportData(ctx context.Context, cfg *packages.Config, m *manifest, dir string, roots []*packages.Package, rep *report) error {
+func assignExportData(ctx context.Context, cfg *packages.Config, m *manifest.Manifest, dir string, roots []*packages.Package, rep *report) error {
 	var all []*packages.Package
 	packages.Visit(roots, nil, func(p *packages.Package) { all = append(all, p) })
 
@@ -206,7 +207,7 @@ func assignExportData(ctx context.Context, cfg *packages.Config, m *manifest, di
 
 // verifyPrebuilt reports whether the manifest has an archive for p, by its
 // ID, test variants included, compiled from p's sources as they are.
-func verifyPrebuilt(m *manifest, dir string, p *packages.Package) bool {
+func verifyPrebuilt(m *manifest.Manifest, dir string, p *packages.Package) bool {
 	entry, ok := m.Packages[p.ID]
 	if !ok || entry.Archive == "" || entry.Sources == "" {
 		return false
@@ -214,7 +215,7 @@ func verifyPrebuilt(m *manifest, dir string, p *packages.Package) bool {
 	if len(p.Errors) > 0 {
 		return false
 	}
-	digest, err := sourcesDigest(filesOf(p))
+	digest, err := manifest.SourcesDigest(filesOf(p))
 	if err != nil || digest != entry.Sources {
 		return false
 	}

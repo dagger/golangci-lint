@@ -243,6 +243,8 @@ type E2e {
       .withDirectory("/src", ws.directory("/helpers/export-driver"))
       .withWorkdir("/src")
       .withExec(["go", "test", "./..."])
+      .withWorkdir("/src/manifest")
+      .withExec(["go", "test", "./..."])
       .sync
     null
   }
