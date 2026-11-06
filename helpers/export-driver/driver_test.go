@@ -185,6 +185,67 @@ func TestStaleArchiveIsNotUsed(t *testing.T) {
 	}
 }
 
+// TestCompileNeverServesOnlyArchives checks that with GOLANGCI_EXPORT_COMPILE
+// set to never, a package whose archive is stale, and every package that
+// imports it, gets no export data, neither compiled by the driver nor from
+// the go command, while the others keep their archives; and that go/packages
+// then type-checks such an import from source.
+func TestCompileNeverServesOnlyArchives(t *testing.T) {
+	mod := writeModule(t, toolchainLang())
+	archives := archivesFor(t, mod)
+	writeFiles(t, mod, map[string]string{"lib/newer.go": "package lib\n\n// Newer is newer.\nfunc Newer() int { return 3 }\n"})
+	t.Setenv(envCompile, "never")
+	resp, rep := serveModule(t, mod, archives, nil)
+	if resp.NotHandled {
+		t.Fatalf("declined: %s", rep.Declined)
+	}
+	if rep.Prebuilt == 0 || rep.Compiled != 0 || rep.TestsCompiled != 0 || rep.GoList != 0 {
+		t.Errorf("report = %+v, want prebuilt archives only", rep)
+	}
+	for _, p := range resp.Packages {
+		stale := strings.HasPrefix(p.ID, "example.com/m/lib") || strings.HasPrefix(p.ID, "example.com/m/app") || strings.HasPrefix(p.ID, "example.com/m/helper")
+		switch {
+		case stale && p.ExportFile != "":
+			t.Errorf("%s, built from old sources or against them, has export data %s", p.ID, p.ExportFile)
+		case p.PkgPath == "fmt" && !strings.HasPrefix(p.ExportFile, archives):
+			t.Errorf("fmt's export data is %q, not its archive", p.ExportFile)
+		}
+	}
+
+	bin := filepath.Join(t.TempDir(), "export-driver")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = mustGetwdOf(t)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build driver: %v\n%s", err, out)
+	}
+	// As a code generator loads a package: its imports from export data,
+	// or from source where there is none.
+	pkgs, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedModule | packages.NeedExportFile,
+		Env: append(os.Environ(),
+			"GOPACKAGESDRIVER="+bin,
+			envArchives+"="+archives,
+			envWorkDir+"="+t.TempDir(),
+			envCompile+"=never",
+		),
+	}, "./app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := packages.PrintErrors(pkgs); n > 0 {
+		t.Fatalf("%d errors loading through the driver", n)
+	}
+	var newer bool
+	for _, imp := range pkgs[0].Types.Imports() {
+		if imp.Path() == "example.com/m/lib" && imp.Scope().Lookup("Newer") != nil {
+			newer = true
+		}
+	}
+	if !newer {
+		t.Error("app's import lib was not type-checked from its sources as they are: Newer is missing")
+	}
+}
+
 func TestDeclines(t *testing.T) {
 	mod := writeModule(t, toolchainLang())
 	archives := archivesFor(t, mod)

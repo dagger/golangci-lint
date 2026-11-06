@@ -31,6 +31,10 @@ const (
 	// envWorkDir is where compiled archives are written; they must outlive
 	// the driver, since the caller reads them after it exits.
 	envWorkDir = "GOLANGCI_EXPORT_WORKDIR"
+	// envCompile, "never", serves the archives there are and compiles no
+	// package: for a caller that type-checks the rest from source, such as
+	// a code generator that reads declarations only.
+	envCompile = "GOLANGCI_EXPORT_COMPILE"
 )
 
 // report is the JSON line written to envLog for each request.

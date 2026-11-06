@@ -105,6 +105,11 @@ func assignExportData(ctx context.Context, cfg *packages.Config, m *manifest, di
 		if _, ok := archive[p]; ok {
 			continue
 		}
+		// A caller that type-checks every package without export data from
+		// source, as go/packages does, gets no archive for it instead.
+		if os.Getenv(envCompile) == "never" {
+			continue
+		}
 		if compilable(p) {
 			compileSet[p] = true
 		} else {
