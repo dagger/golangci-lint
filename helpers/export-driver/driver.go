@@ -32,9 +32,11 @@ const (
 	// envWorkDir is where compiled archives are written; they must outlive
 	// the driver, since the caller reads them after it exits.
 	envWorkDir = "GOLANGCI_EXPORT_WORKDIR"
-	// envCompile, "never", serves the archives there are and compiles no
-	// package: for a caller that type-checks the rest from source, such as
-	// a code generator that reads declarations only.
+	// envCompile, "never", is for a caller that reads declarations only,
+	// such as a code generator, and type-checks from source every package
+	// without export data: the driver serves the archives there are and
+	// compiles no package, and serves a module whatever its Go language
+	// version.
 	envCompile = "GOLANGCI_EXPORT_COMPILE"
 )
 
@@ -187,12 +189,14 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 
 	// Through a driver the caller loses Module, so it type-checks with the
 	// Go version it was built with instead of the module's. Only serve
-	// modules whose language version that is.
+	// modules whose language version that is, so that a lint's findings
+	// are the module's own; a caller that reads declarations only accepts
+	// at a newer language version all that the module's accepts.
 	for _, root := range roots {
 		if root.Module == nil || root.Module.GoVersion == "" {
 			return declined("package " + root.ID + " has no module Go version")
 		}
-		if langVersion(root.Module.GoVersion) != langVersion(linterGo) {
+		if os.Getenv(envCompile) != "never" && langVersion(root.Module.GoVersion) != langVersion(linterGo) {
 			return declined(fmt.Sprintf("module %s is go %s, linter built with %s", root.Module.Path, root.Module.GoVersion, linterGo))
 		}
 	}

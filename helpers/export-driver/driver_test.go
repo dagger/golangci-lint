@@ -247,6 +247,67 @@ func TestCompileNeverServesOnlyArchives(t *testing.T) {
 	}
 }
 
+// TestCompileNeverServesAnyGoVersion checks that a caller that reads
+// declarations only, with GOLANGCI_EXPORT_COMPILE set to never, is served a
+// module whose go directive is older than the toolchain's, which a lint is
+// not: every package from the archives, with nothing compiled, both as serve
+// answers and through the driver binary as go/packages runs it.
+func TestCompileNeverServesAnyGoVersion(t *testing.T) {
+	mod := writeModule(t, "1.22")
+	archives := archivesFor(t, mod)
+	t.Setenv(envCompile, "never")
+	resp, rep := serveModule(t, mod, archives, nil)
+	if resp.NotHandled {
+		t.Fatalf("declined: %s", rep.Declined)
+	}
+	if rep.Prebuilt == 0 || rep.Compiled != 0 || rep.GoList != 0 || len(rep.Missing) != 0 {
+		t.Errorf("report = %+v, want prebuilt archives only", rep)
+	}
+	for _, p := range resp.Packages {
+		if p.PkgPath == "unsafe" || isTestMain(p) {
+			continue
+		}
+		if !strings.HasPrefix(p.ExportFile, archives) {
+			t.Errorf("%s's export data is %q, not its archive", p.ID, p.ExportFile)
+		}
+	}
+
+	bin := filepath.Join(t.TempDir(), "export-driver")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = mustGetwdOf(t)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build driver: %v\n%s", err, out)
+	}
+	logPath := filepath.Join(t.TempDir(), "driver.log")
+	pkgs, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedModule | packages.NeedExportFile,
+		Env: append(os.Environ(),
+			"GOPACKAGESDRIVER="+bin,
+			envArchives+"="+archives,
+			envLog+"="+logPath,
+			envWorkDir+"="+t.TempDir(),
+			envCompile+"=never",
+		),
+	}, "./app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := packages.PrintErrors(pkgs); n > 0 {
+		t.Fatalf("%d errors loading through the driver", n)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("driver was not used: %v", err)
+	}
+	var logged report
+	if err := json.Unmarshal(log, &logged); err != nil {
+		t.Fatalf("driver log %q: %v", log, err)
+	}
+	if logged.Declined != "" || logged.Prebuilt == 0 || logged.Compiled != 0 || logged.GoList != 0 || len(logged.Missing) != 0 {
+		t.Errorf("driver log = %s, want prebuilt archives only", log)
+	}
+}
+
 func TestDeclines(t *testing.T) {
 	mod := writeModule(t, toolchainLang())
 	archives := archivesFor(t, mod)
