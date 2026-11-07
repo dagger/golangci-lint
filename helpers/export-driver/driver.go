@@ -6,7 +6,10 @@ import (
 	"debug/buildinfo"
 	"encoding/json"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/dagger/golangci-lint/helpers/export-driver/manifest"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -28,6 +32,12 @@ const (
 	// envWorkDir is where compiled archives are written; they must outlive
 	// the driver, since the caller reads them after it exits.
 	envWorkDir = "GOLANGCI_EXPORT_WORKDIR"
+	// envCompile, "never", is for a caller that reads declarations only,
+	// such as a code generator, and type-checks from source every package
+	// without export data: the driver serves the archives there are and
+	// compiles no package, and serves a module whatever its Go language
+	// version.
+	envCompile = "GOLANGCI_EXPORT_COMPILE"
 )
 
 // report is the JSON line written to envLog for each request.
@@ -44,6 +54,9 @@ type report struct {
 	// CompileErrors are packages this driver failed to compile, which
 	// fell back to the go command.
 	CompileErrors []string `json:"compileErrors,omitempty"`
+	// ListedCompiled is set when the manifest didn't give every package's
+	// compiled files, so the go command listed them, running cgo.
+	ListedCompiled bool `json:"listedCompiled,omitempty"`
 }
 
 func runDriver(ctx context.Context, patterns []string, stdin io.Reader, stdout io.Writer) error {
@@ -100,7 +113,7 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 	if reason := unsupportedBuildFlags(req.BuildFlags); reason != "" {
 		return declined(reason)
 	}
-	m, err := readManifest(dir)
+	m, err := manifest.Read(dir)
 	if err != nil {
 		return declined("manifest: " + err.Error())
 	}
@@ -133,8 +146,13 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 		return declined("linter Go version: " + err.Error())
 	}
 
-	mode := req.Mode&^packages.NeedExportFile |
-		packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
+	// The packages' compiled files come from the manifest, which saves the
+	// go command running cgo for every cgo package; unless it misses one.
+	// go/packages lists compiled files for any of the modes that type-check,
+	// which the caller does itself, from what this driver answers.
+	mode := req.Mode&^(packages.NeedExportFile|packages.NeedCompiledGoFiles|
+		packages.NeedSyntax|packages.NeedTypes|packages.NeedTypesInfo|packages.NeedTypesSizes) |
+		packages.NeedName | packages.NeedFiles |
 		packages.NeedImports | packages.NeedDeps | packages.NeedModule | packages.NeedEmbedFiles | packages.NeedEmbedPatterns
 	cfg := &packages.Config{
 		Context:    ctx,
@@ -147,20 +165,43 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 	if err != nil {
 		return nil, report{}, err
 	}
+	// cgo's output in the archives is good only for the C settings it was
+	// made with; with others, the go command lists cgo's output afresh.
+	cgoMatches := m.CgoEnabled && maps.Equal(m.Cgo, manifest.CgoSettings(ctx, env))
+	// cgo's output imports packages, such as runtime/cgo, that the go
+	// command leaves out of the listing unless it lists compiled files.
+	var cgoImports []*packages.Package
+	if cgoMatches {
+		plain := *cfg
+		plain.Tests = false
+		if cgoImports, err = packages.Load(&plain, "runtime/cgo", "syscall"); err != nil {
+			return nil, report{}, err
+		}
+	}
+	listedCompiled := false
+	if !compiledFromManifest(m, dir, roots, cgoImports, cgoMatches, env["GOMODCACHE"]) || !cgoOutputMatches(m, dir, roots) {
+		cfg.Mode |= packages.NeedCompiledGoFiles
+		if roots, err = packages.Load(cfg, patterns...); err != nil {
+			return nil, report{}, err
+		}
+		listedCompiled = true
+	}
 
 	// Through a driver the caller loses Module, so it type-checks with the
 	// Go version it was built with instead of the module's. Only serve
-	// modules whose language version that is.
+	// modules whose language version that is, so that a lint's findings
+	// are the module's own; a caller that reads declarations only accepts
+	// at a newer language version all that the module's accepts.
 	for _, root := range roots {
 		if root.Module == nil || root.Module.GoVersion == "" {
 			return declined("package " + root.ID + " has no module Go version")
 		}
-		if langVersion(root.Module.GoVersion) != langVersion(linterGo) {
+		if os.Getenv(envCompile) != "never" && langVersion(root.Module.GoVersion) != langVersion(linterGo) {
 			return declined(fmt.Sprintf("module %s is go %s, linter built with %s", root.Module.Path, root.Module.GoVersion, linterGo))
 		}
 	}
 
-	rep := report{Roots: len(roots)}
+	rep := report{Roots: len(roots), ListedCompiled: listedCompiled}
 	if req.Mode&packages.NeedExportFile != 0 {
 		if err := assignExportData(ctx, cfg, m, dir, roots, &rep); err != nil {
 			return nil, report{}, err
@@ -179,6 +220,167 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 		resp.Roots = append(resp.Roots, r.ID)
 	}
 	return resp, rep, nil
+}
+
+// compiledFromManifest sets each package's compiled Go files as the go
+// command would list them, and reports whether it could for all of them. A
+// package in the manifest compiles its Go files, or for a cgo package, when
+// cgoMatches and its content is fixed (fixedContent), its other Go files and
+// cgo's output in the manifest's directory. A package with no Go files,
+// unsafe and a test main, whose _testmain.go has no cgo, compile their Go
+// files too, as does any other package none of whose Go files imports "C":
+// that is how the go command tells a cgo package. Only a cgo package the
+// manifest lacks needs the go command to list what cgo writes for it.
+//
+// cgo's output imports packages the cgo files don't, such as runtime/cgo
+// and syscall, which the go command lists among a cgo package's imports only
+// when it lists the compiled files: they are added from the packages loaded,
+// roots' or extra's, one package for each ID.
+func compiledFromManifest(m *manifest.Manifest, dir string, roots, extra []*packages.Package, cgoMatches bool, modcache string) bool {
+	byID := map[string]*packages.Package{}
+	packages.Visit(roots, nil, func(p *packages.Package) { byID[p.ID] = p })
+	packages.Visit(extra, nil, func(p *packages.Package) {
+		for path, imp := range p.Imports {
+			p.Imports[path] = byID[imp.ID]
+		}
+		if _, ok := byID[p.ID]; !ok {
+			byID[p.ID] = p
+		}
+	})
+	byPath := map[string]*packages.Package{}
+	for id, p := range byID {
+		if id == p.PkgPath {
+			byPath[id] = p
+		}
+	}
+	// Every package reached from the roots, through the imports added too.
+	ok := true
+	done := map[*packages.Package]bool{}
+	queue := slices.Clone(roots)
+	for len(queue) > 0 {
+		p := queue[0]
+		queue = queue[1:]
+		if done[p] {
+			continue
+		}
+		done[p] = true
+		e, listed := m.Packages[p.ID]
+		switch {
+		case listed && len(e.CgoOutput) > 0 && (!cgoMatches || !fixedContent(p, e, modcache)):
+			ok = false
+		case listed && len(e.CgoOutput) > 0:
+			cgo := map[string]bool{}
+			for _, f := range e.CgoFiles {
+				cgo[filepath.Join(p.Dir, f)] = true
+			}
+			p.CompiledGoFiles = nil
+			for _, g := range p.GoFiles {
+				if !cgo[g] {
+					p.CompiledGoFiles = append(p.CompiledGoFiles, g)
+				}
+			}
+			for _, o := range e.CgoOutput {
+				out := filepath.Join(dir, filepath.FromSlash(o))
+				p.CompiledGoFiles = append(p.CompiledGoFiles, out)
+				if !addImports(p, out, byPath) {
+					ok = false
+				}
+			}
+		case listed, len(p.GoFiles) == 0, p.PkgPath == "unsafe", isTestMain(p), !importsC(p.GoFiles) && !hasSwig(p.OtherFiles):
+			p.CompiledGoFiles = slices.Clone(p.GoFiles)
+		default:
+			ok = false
+		}
+		for _, imp := range p.Imports {
+			queue = append(queue, imp)
+		}
+	}
+	return ok
+}
+
+// cgoOutputMatches reports whether every package given the manifest's copy of
+// cgo's output was compiled from its sources as they are. One that wasn't
+// gets fresh export data, which must be checked against cgo's fresh output.
+func cgoOutputMatches(m *manifest.Manifest, dir string, roots []*packages.Package) bool {
+	ok := true
+	packages.Visit(roots, nil, func(p *packages.Package) {
+		if e := m.Packages[p.ID]; len(e.CgoOutput) > 0 && !verifyPrebuilt(m, dir, p) {
+			ok = false
+		}
+	})
+	return ok
+}
+
+// importsC reports whether any of files imports "C", or can't be read to
+// tell.
+func importsC(files []string) bool {
+	for _, f := range files {
+		file, err := parser.ParseFile(token.NewFileSet(), f, nil, parser.ImportsOnly)
+		if err != nil {
+			return true
+		}
+		for _, spec := range file.Imports {
+			if spec.Path.Value == `"C"` {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasSwig reports whether a package has SWIG files, which make it use cgo
+// too.
+func hasSwig(files []string) bool {
+	for _, f := range files {
+		if strings.HasSuffix(f, ".swig") || strings.HasSuffix(f, ".swigcxx") {
+			return true
+		}
+	}
+	return false
+}
+
+// fixedContent reports whether what a cgo package's C compiles read, which
+// can be any file of its module, is fixed by what identifies it and is the
+// same as the archives': the standard library's, by the Go version, or a
+// module version's in the module cache, by its checksum, if the archives
+// were made from that version. A package of the main module, of a local
+// replacement or of a vendor directory can include files its digest
+// doesn't cover, so the go command runs cgo for it afresh.
+func fixedContent(p *packages.Package, e manifest.Entry, modcache string) bool {
+	if p.Module == nil {
+		return true
+	}
+	v := moduleVersion(p.Module)
+	rel, err := filepath.Rel(modcache, p.Dir)
+	return !p.Module.Main && v != "" && v == e.Module && modcache != "" && err == nil && !strings.HasPrefix(rel, "..")
+}
+
+// addImports adds to p's imports the packages file imports that p's don't
+// have, from byPath, and reports whether it found them all. C is cgo's, no
+// package.
+func addImports(p *packages.Package, file string, byPath map[string]*packages.Package) bool {
+	f, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.ImportsOnly)
+	if err != nil {
+		return false
+	}
+	for _, spec := range f.Imports {
+		path, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			return false
+		}
+		if _, ok := p.Imports[path]; ok || path == "C" {
+			continue
+		}
+		imp, ok := byPath[path]
+		if !ok {
+			return false
+		}
+		if p.Imports == nil {
+			p.Imports = map[string]*packages.Package{}
+		}
+		p.Imports[path] = imp
+	}
+	return true
 }
 
 // unsupportedBuildFlags rejects build flags that change what gets compiled
@@ -215,7 +417,7 @@ func nonNil(s []string) []string {
 }
 
 func goEnv(ctx context.Context, env []string) (map[string]string, error) {
-	cmd := exec.CommandContext(ctx, "go", "env", "-json", "GOVERSION", "GOOS", "GOARCH", "CGO_ENABLED", "GOFLAGS")
+	cmd := exec.CommandContext(ctx, "go", append([]string{"env", "-json", "GOFLAGS"}, manifest.EnvVars...)...)
 	cmd.Env = env
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

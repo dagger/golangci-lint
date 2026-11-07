@@ -12,12 +12,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/dagger/golangci-lint/helpers/export-driver/manifest"
 )
 
 // writeManifestDir writes an archives directory for the packages the
 // patterns need, with their tests, from `go list -export`: the layout a
-// per-package builder provides, for tests and comparisons. Test variants are
-// left out, as a builder of plain packages has none.
+// per-package builder provides, for tests and comparisons. It has every
+// package go list compiles, test variants included, but the test mains, and
+// a copy of cgo's output for each cgo package.
 func writeManifestDir(ctx context.Context, out string, args []string) error {
 	var flags, patterns []string
 	for i, a := range args {
@@ -38,7 +41,7 @@ func writeManifestDir(ctx context.Context, out string, args []string) error {
 		return fmt.Errorf("GOFLAGS: %w", err)
 	}
 	listArgs := append([]string{"list", "-e", "-export", "-compiled", "-deps", "-test",
-		"-json=ImportPath,ForTest,Dir,Export,GoFiles,CgoFiles,CompiledGoFiles,EmbedFiles,CFiles,CXXFiles,HFiles,SFiles,MFiles,FFiles,SwigFiles,SwigCXXFiles,SysoFiles"},
+		"-json=" + manifest.ListFields + ",Export,CompiledGoFiles"},
 		flags...)
 	listArgs = append(listArgs, "--")
 	listArgs = append(listArgs, patterns...)
@@ -51,67 +54,66 @@ func writeManifestDir(ctx context.Context, out string, args []string) error {
 	if err := os.MkdirAll(filepath.Join(out, "archives"), 0o755); err != nil {
 		return err
 	}
-	m := manifest{
-		Version:    manifestVersion,
-		GoVersion:  env["GOVERSION"],
-		GOOS:       env["GOOS"],
-		GOARCH:     env["GOARCH"],
-		CgoEnabled: env["CGO_ENABLED"] == "1",
-		// Flags on the command line override GOFLAGS', so they come last.
-		BuildTags: nonNil(buildTags(append(goflags, flags...))),
-		Packages:  map[string]manifestEntry{},
-	}
+	// Flags on the command line override GOFLAGS', so they come last.
+	m := manifest.New(ctx, env, buildTags(append(goflags, flags...)))
 	dec := json.NewDecoder(&stdout)
 	for {
 		var p struct {
-			ImportPath, ForTest, Dir, Export                 string
-			GoFiles, CgoFiles, CompiledGoFiles, EmbedFiles   []string
-			CFiles, CXXFiles, HFiles, SFiles, MFiles, FFiles []string
-			SwigFiles, SwigCXXFiles, SysoFiles               []string
+			manifest.Package
+			Export          string
+			CompiledGoFiles []string
 		}
 		if err := dec.Decode(&p); err == io.EOF {
 			break
 		} else if err != nil {
 			return err
 		}
-		if p.Export == "" || p.ForTest != "" || strings.Contains(p.ImportPath, " [") || strings.HasSuffix(p.ImportPath, ".test") {
+		if p.Export == "" || strings.HasSuffix(p.ImportPath, ".test") {
 			continue
 		}
-		abs := func(groups ...[]string) []string {
-			var out []string
-			for _, g := range groups {
-				for _, f := range g {
-					if !filepath.IsAbs(f) {
-						f = filepath.Join(p.Dir, f)
-					}
-					out = append(out, f)
-				}
-			}
-			return out
-		}
-		// The same files go/packages reports, so the driver's digest matches.
-		digest, err := sourcesDigest(packageFiles{
-			Dir:             p.Dir,
-			GoFiles:         abs(p.GoFiles, p.CgoFiles),
-			OtherFiles:      abs(p.CFiles, p.CXXFiles, p.MFiles, p.HFiles, p.FFiles, p.SFiles, p.SwigFiles, p.SwigCXXFiles, p.SysoFiles),
-			EmbedFiles:      abs(p.EmbedFiles),
-			CompiledGoFiles: abs(p.CompiledGoFiles),
-		})
-		if err != nil {
-			return err
-		}
 		name := sha256.Sum256([]byte(p.ImportPath))
-		rel := filepath.Join("archives", hex.EncodeToString(name[:8])+"-"+filepath.Base(p.ImportPath)+".a")
+		path, _, _ := strings.Cut(p.ImportPath, " [")
+		rel := filepath.Join("archives", hex.EncodeToString(name[:8])+"-"+filepath.Base(path)+".a")
 		if err := copyFile(p.Export, filepath.Join(out, rel)); err != nil {
 			return err
 		}
-		m.Packages[p.ImportPath] = manifestEntry{Archive: filepath.ToSlash(rel), Sources: digest}
+		// cgo's output, which go list's compiled files are besides the plain
+		// Go files, copied beside the archives.
+		var generated, outputs []string
+		if len(p.CgoFiles) > 0 {
+			plain := map[string]bool{}
+			for _, g := range p.GoFiles {
+				plain[filepath.Join(p.Dir, g)] = true
+			}
+			cgoDir := filepath.Join("cgo", hex.EncodeToString(name[:8]))
+			if err := os.MkdirAll(filepath.Join(out, cgoDir), 0o755); err != nil {
+				return err
+			}
+			for _, c := range p.CompiledGoFiles {
+				if !filepath.IsAbs(c) {
+					c = filepath.Join(p.Dir, c)
+				}
+				if plain[c] {
+					continue
+				}
+				o := filepath.Join(cgoDir, filepath.Base(c))
+				if err := copyFile(c, filepath.Join(out, o)); err != nil {
+					return err
+				}
+				generated, outputs = append(generated, c), append(outputs, o)
+			}
+		}
+		entry, err := manifest.NewEntry(p.Package, rel, generated, outputs, env["GOMODCACHE"])
+		if err != nil {
+			return err
+		}
+		m.Packages[p.ImportPath] = entry
 	}
-	data, err := json.MarshalIndent(m, "", "  ")
+	data, err := m.Encode()
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(out, "manifest.json"), append(data, '\n'), 0o644)
+	return os.WriteFile(filepath.Join(out, "manifest.json"), data, 0o644)
 }
 
 func copyFile(from, to string) error {

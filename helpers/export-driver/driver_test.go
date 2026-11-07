@@ -3,13 +3,18 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/dagger/golangci-lint/helpers/export-driver/manifest"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -131,10 +136,12 @@ func TestServesFilesAndExportData(t *testing.T) {
 		}
 	}
 	if !sawVariant {
-		t.Error("the test variant of helper is not a dependency; the fixture no longer covers compiling one")
+		t.Error("the test variant of helper is not a dependency; the fixture no longer covers serving one")
 	}
-	if rep.Prebuilt == 0 || rep.Compiled == 0 || rep.TestsCompiled == 0 || rep.GoList != 0 || len(rep.Missing) != 0 || len(rep.CompileErrors) != 0 {
-		t.Errorf("report = %+v, want prebuilt and compiled archives only", rep)
+	// The archives have every test variant and cgo's output: the driver
+	// compiles nothing and the go command lists no compiled files.
+	if rep.Prebuilt == 0 || rep.Compiled != 0 || rep.TestsCompiled == 0 || rep.GoList != 0 || len(rep.Missing) != 0 || len(rep.CompileErrors) != 0 || rep.ListedCompiled {
+		t.Errorf("report = %+v, want prebuilt archives only", rep)
 	}
 }
 
@@ -143,7 +150,7 @@ func TestServesFilesAndExportData(t *testing.T) {
 func TestStaleArchiveIsNotUsed(t *testing.T) {
 	mod := writeModule(t, toolchainLang())
 	archives := archivesFor(t, mod)
-	var m manifest
+	var m manifest.Manifest
 	data, err := os.ReadFile(filepath.Join(archives, "manifest.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -179,16 +186,138 @@ func TestStaleArchiveIsNotUsed(t *testing.T) {
 	}
 }
 
+// TestCompileNeverServesOnlyArchives checks that with GOLANGCI_EXPORT_COMPILE
+// set to never, a package whose archive is stale, and every package that
+// imports it, gets no export data, neither compiled by the driver nor from
+// the go command, while the others keep their archives; and that go/packages
+// then type-checks such an import from source.
+func TestCompileNeverServesOnlyArchives(t *testing.T) {
+	mod := writeModule(t, toolchainLang())
+	archives := archivesFor(t, mod)
+	writeFiles(t, mod, map[string]string{"lib/newer.go": "package lib\n\n// Newer is newer.\nfunc Newer() int { return 3 }\n"})
+	t.Setenv(envCompile, "never")
+	resp, rep := serveModule(t, mod, archives, nil)
+	if resp.NotHandled {
+		t.Fatalf("declined: %s", rep.Declined)
+	}
+	if rep.Prebuilt == 0 || rep.Compiled != 0 || rep.TestsCompiled != 0 || rep.GoList != 0 {
+		t.Errorf("report = %+v, want prebuilt archives only", rep)
+	}
+	for _, p := range resp.Packages {
+		stale := strings.HasPrefix(p.ID, "example.com/m/lib") || strings.HasPrefix(p.ID, "example.com/m/app") || strings.HasPrefix(p.ID, "example.com/m/helper")
+		switch {
+		case stale && p.ExportFile != "":
+			t.Errorf("%s, built from old sources or against them, has export data %s", p.ID, p.ExportFile)
+		case p.PkgPath == "fmt" && !strings.HasPrefix(p.ExportFile, archives):
+			t.Errorf("fmt's export data is %q, not its archive", p.ExportFile)
+		}
+	}
+
+	bin := filepath.Join(t.TempDir(), "export-driver")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = mustGetwdOf(t)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build driver: %v\n%s", err, out)
+	}
+	// As a code generator loads a package: its imports from export data,
+	// or from source where there is none.
+	pkgs, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedModule | packages.NeedExportFile,
+		Env: append(os.Environ(),
+			"GOPACKAGESDRIVER="+bin,
+			envArchives+"="+archives,
+			envWorkDir+"="+t.TempDir(),
+			envCompile+"=never",
+		),
+	}, "./app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := packages.PrintErrors(pkgs); n > 0 {
+		t.Fatalf("%d errors loading through the driver", n)
+	}
+	var newer bool
+	for _, imp := range pkgs[0].Types.Imports() {
+		if imp.Path() == "example.com/m/lib" && imp.Scope().Lookup("Newer") != nil {
+			newer = true
+		}
+	}
+	if !newer {
+		t.Error("app's import lib was not type-checked from its sources as they are: Newer is missing")
+	}
+}
+
+// TestCompileNeverServesAnyGoVersion checks that a caller that reads
+// declarations only, with GOLANGCI_EXPORT_COMPILE set to never, is served a
+// module whose go directive is older than the toolchain's, which a lint is
+// not: every package from the archives, with nothing compiled, both as serve
+// answers and through the driver binary as go/packages runs it.
+func TestCompileNeverServesAnyGoVersion(t *testing.T) {
+	mod := writeModule(t, "1.22")
+	archives := archivesFor(t, mod)
+	t.Setenv(envCompile, "never")
+	resp, rep := serveModule(t, mod, archives, nil)
+	if resp.NotHandled {
+		t.Fatalf("declined: %s", rep.Declined)
+	}
+	if rep.Prebuilt == 0 || rep.Compiled != 0 || rep.GoList != 0 || len(rep.Missing) != 0 {
+		t.Errorf("report = %+v, want prebuilt archives only", rep)
+	}
+	for _, p := range resp.Packages {
+		if p.PkgPath == "unsafe" || isTestMain(p) {
+			continue
+		}
+		if !strings.HasPrefix(p.ExportFile, archives) {
+			t.Errorf("%s's export data is %q, not its archive", p.ID, p.ExportFile)
+		}
+	}
+
+	bin := filepath.Join(t.TempDir(), "export-driver")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = mustGetwdOf(t)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build driver: %v\n%s", err, out)
+	}
+	logPath := filepath.Join(t.TempDir(), "driver.log")
+	pkgs, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedModule | packages.NeedExportFile,
+		Env: append(os.Environ(),
+			"GOPACKAGESDRIVER="+bin,
+			envArchives+"="+archives,
+			envLog+"="+logPath,
+			envWorkDir+"="+t.TempDir(),
+			envCompile+"=never",
+		),
+	}, "./app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := packages.PrintErrors(pkgs); n > 0 {
+		t.Fatalf("%d errors loading through the driver", n)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("driver was not used: %v", err)
+	}
+	var logged report
+	if err := json.Unmarshal(log, &logged); err != nil {
+		t.Fatalf("driver log %q: %v", log, err)
+	}
+	if logged.Declined != "" || logged.Prebuilt == 0 || logged.Compiled != 0 || logged.GoList != 0 || len(logged.Missing) != 0 {
+		t.Errorf("driver log = %s, want prebuilt archives only", log)
+	}
+}
+
 func TestDeclines(t *testing.T) {
 	mod := writeModule(t, toolchainLang())
 	archives := archivesFor(t, mod)
 
-	editManifest := func(t *testing.T, edit func(*manifest)) string {
+	editManifest := func(t *testing.T, edit func(*manifest.Manifest)) string {
 		data, err := os.ReadFile(filepath.Join(archives, "manifest.json"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		var m manifest
+		var m manifest.Manifest
 		if err := json.Unmarshal(data, &m); err != nil {
 			t.Fatal(err)
 		}
@@ -214,10 +343,10 @@ func TestDeclines(t *testing.T) {
 	}{
 		{name: "no archives", archives: func(*testing.T) string { return "" }},
 		{name: "other toolchain", archives: func(t *testing.T) string {
-			return editManifest(t, func(m *manifest) { m.GoVersion = "go1.1" })
+			return editManifest(t, func(m *manifest.Manifest) { m.GoVersion = "go1.1" })
 		}},
 		{name: "other platform", archives: func(t *testing.T) string {
-			return editManifest(t, func(m *manifest) { m.GOARCH = "other" })
+			return editManifest(t, func(m *manifest.Manifest) { m.GOARCH = "other" })
 		}},
 		{name: "other tags", archives: func(t *testing.T) string { return archives },
 			mutate: func(r *packages.DriverRequest) { r.BuildFlags = []string{"-tags", "extra"} }},
@@ -332,7 +461,7 @@ func writeFiles(t *testing.T, dir string, files map[string]string) {
 
 func manifestArchive(t *testing.T, archives, pkgPath string) string {
 	t.Helper()
-	m, err := readManifest(archives)
+	m, err := manifest.Read(archives)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,6 +561,166 @@ func TestCgoFlagsChangeArchive(t *testing.T) {
 	}
 	if got := packageByID(t, resp, "example.com/m/cval").ExportFile; got == prebuilt || got == "" {
 		t.Errorf("after the C flags changed, cval's export data = %q, want a fresh archive", got)
+	}
+}
+
+// writeStdCgoModule adds a package that imports os/user, a standard library
+// package that uses cgo when cgo is on, whose content the Go version fixes:
+// the driver serves it with the archives' copy of cgo's output.
+func writeStdCgoModule(t *testing.T) string {
+	t.Helper()
+	t.Setenv("CGO_ENABLED", "1")
+	mod := writeModule(t, toolchainLang())
+	writeFiles(t, mod, map[string]string{
+		"who/who.go": "// Package who names the user.\npackage who\n\nimport \"os/user\"\n\n// Name is the user's name.\nfunc Name() string { u, _ := user.Current(); return u.Username }\n",
+	})
+	return mod
+}
+
+// TestCgoOutputImportsAreImports checks that a cgo package served with the
+// archives' copy of cgo's output imports what that output imports, such as
+// runtime/cgo and syscall, which the cgo files themselves don't: without
+// them, golangci-lint can't type-check the package.
+func TestCgoOutputImportsAreImports(t *testing.T) {
+	if _, err := exec.LookPath("gcc"); err != nil {
+		t.Skip("no C compiler")
+	}
+	mod := writeStdCgoModule(t)
+	archives := archivesFor(t, mod)
+	if m, err := manifest.Read(archives); err != nil || len(m.Packages["os/user"].CgoOutput) == 0 {
+		t.Fatalf("os/user doesn't use cgo here: %v", err)
+	}
+	resp, rep := serveModule(t, mod, archives, nil)
+	if resp.NotHandled || rep.ListedCompiled {
+		t.Fatalf("not served from the archives: %+v", rep)
+	}
+	p := packageByID(t, resp, "os/user")
+	if p.ExportFile != manifestArchive(t, archives, "os/user") {
+		t.Errorf("os/user's export data = %q, want its archive", p.ExportFile)
+	}
+	for _, f := range p.CompiledGoFiles {
+		file, err := parser.ParseFile(token.NewFileSet(), f, nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, spec := range file.Imports {
+			path, _ := strconv.Unquote(spec.Path.Value)
+			if _, ok := p.Imports[path]; !ok && path != "C" {
+				t.Errorf("%s imports %s, which os/user's imports lack", filepath.Base(f), path)
+			}
+		}
+	}
+}
+
+// TestStaleCgoEntryListsCompiledFiles checks that when a cgo package served
+// with the archives' copy of cgo's output wasn't compiled from its sources
+// as they are, the go command lists compiled files afresh, so the package's
+// fresh export data comes with cgo's fresh output.
+func TestStaleCgoEntryListsCompiledFiles(t *testing.T) {
+	if _, err := exec.LookPath("gcc"); err != nil {
+		t.Skip("no C compiler")
+	}
+	mod := writeStdCgoModule(t)
+	archives := archivesFor(t, mod)
+	path := filepath.Join(archives, "manifest.json")
+	m, err := manifest.Read(archives)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := m.Packages["os/user"]
+	e.Sources = "sha256:stale"
+	m.Packages["os/user"] = e
+	data, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resp, rep := serveModule(t, mod, archives, nil)
+	if resp.NotHandled || !rep.ListedCompiled {
+		t.Fatalf("a stale cgo entry didn't make the go command list compiled files: %+v", rep)
+	}
+	for _, f := range packageByID(t, resp, "os/user").CompiledGoFiles {
+		if strings.HasPrefix(f, archives) {
+			t.Errorf("os/user compiles the archives' stale cgo output %s", f)
+		}
+	}
+}
+
+// TestUnlistedPackageWithoutCgo checks that a package the archives lack,
+// such as one written after they were built, doesn't make the go command
+// list compiled files for every package when it uses no cgo: its compiled
+// files are its Go files, and the others keep the archives' cgo output.
+func TestUnlistedPackageWithoutCgo(t *testing.T) {
+	if _, err := exec.LookPath("gcc"); err != nil {
+		t.Skip("no C compiler")
+	}
+	mod := writeStdCgoModule(t)
+	archives := archivesFor(t, mod)
+	writeFiles(t, mod, map[string]string{"later/later.go": "// Package later came after the archives.\npackage later\n\nimport _ \"example.com/m/who\"\n"})
+	resp, rep := serveModule(t, mod, archives, nil)
+	if resp.NotHandled || rep.ListedCompiled {
+		t.Fatalf("a package without cgo the archives lack made the go command list compiled files: %+v", rep)
+	}
+	p := packageByID(t, resp, "example.com/m/later")
+	if !slices.Equal(p.CompiledGoFiles, p.GoFiles) {
+		t.Errorf("later compiles %v, want its Go files %v", p.CompiledGoFiles, p.GoFiles)
+	}
+}
+
+// TestFixedContent checks which cgo packages the archives' cgo output is
+// used for: the standard library's, and a module version's from the module
+// cache that the archives were made from, never a changed version's, a
+// vendored copy's, a local replacement's or the main module's.
+func TestFixedContent(t *testing.T) {
+	cache := "/go/pkg/mod"
+	dep := &packages.Module{Path: "example.com/dep", Version: "v1.0.0"}
+	for _, c := range []struct {
+		name string
+		p    *packages.Package
+		e    manifest.Entry
+		want bool
+	}{
+		{"standard library", &packages.Package{Dir: "/usr/local/go/src/net"}, manifest.Entry{}, true},
+		{"same version", &packages.Package{Module: dep, Dir: cache + "/example.com/dep@v1.0.0/c"}, manifest.Entry{Module: "example.com/dep@v1.0.0"}, true},
+		{"other version", &packages.Package{Module: dep, Dir: cache + "/example.com/dep@v1.0.0/c"}, manifest.Entry{Module: "example.com/dep@v0.9.0"}, false},
+		{"vendored", &packages.Package{Module: dep, Dir: "/src/vendor/example.com/dep/c"}, manifest.Entry{Module: "example.com/dep@v1.0.0"}, false},
+		{"local replacement", &packages.Package{Module: &packages.Module{Path: "example.com/dep", Version: "v1.0.0", Replace: &packages.Module{Path: "../dep"}}, Dir: "/src/dep/c"}, manifest.Entry{}, false},
+		{"main module", &packages.Package{Module: &packages.Module{Path: "example.com/m", Main: true}, Dir: "/src/c"}, manifest.Entry{}, false},
+	} {
+		if got := fixedContent(c.p, c.e, cache); got != c.want {
+			t.Errorf("%s: fixedContent = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestCgoHeaderOutsideThePackage checks that a cgo package of the main module
+// is never served with the archives' cgo output, which a header outside its
+// directory, not in its digest, may have changed: the go command runs cgo
+// for it, as without the driver. The go command doesn't track such a header
+// either, so the lint runs with an empty build cache, as golangci-lint's own
+// go list would need to see the change.
+func TestCgoHeaderOutsideThePackage(t *testing.T) {
+	if _, err := exec.LookPath("gcc"); err != nil {
+		t.Skip("no C compiler")
+	}
+	t.Setenv("CGO_ENABLED", "1")
+	mod := writeModule(t, toolchainLang())
+	writeFiles(t, mod, map[string]string{
+		"native/defs.inc": "#define VALUE 1\n",
+		"cval/cval.go":    "// Package cval exports a C constant.\npackage cval\n\n// #include \"../native/defs.inc\"\nimport \"C\"\n\n// Value is C's VALUE.\nconst Value = C.VALUE\n",
+	})
+	archives := archivesFor(t, mod)
+	prebuilt := manifestArchive(t, archives, "example.com/m/cval")
+	writeFiles(t, mod, map[string]string{"native/defs.inc": "#define VALUE 2\n"})
+	t.Setenv("GOCACHE", t.TempDir())
+	resp, rep := serveModule(t, mod, archives, nil)
+	if resp.NotHandled {
+		t.Fatalf("declined: %s", rep.Declined)
+	}
+	if got := packageByID(t, resp, "example.com/m/cval").ExportFile; got == prebuilt || got == "" {
+		t.Errorf("after a header outside cval changed, its export data = %q, want a fresh archive", got)
 	}
 }
 
@@ -574,7 +863,7 @@ func TestTagsOnTheCommandLineOverrideGOFLAGS(t *testing.T) {
 	if err := writeManifestDir(context.Background(), out, []string{"-tags=explicit", "--", "./..."}); err != nil {
 		t.Fatal(err)
 	}
-	m, err := readManifest(out)
+	m, err := manifest.Read(out)
 	if err != nil {
 		t.Fatal(err)
 	}

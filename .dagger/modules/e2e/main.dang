@@ -136,11 +136,11 @@ type E2e {
     assert(got.length > 0, "linting through the export driver found nothing: " + driven)
     assert(got == want, "findings differ through the export driver:\nwithout:\n" + want.join("\n") + "\nwith:\n" + got.join("\n"))
     assert(plain.hasPrefix("exit code: 1") and driven.hasPrefix("exit code: 1"), "lint exit codes differ: " + plain + "\n" + driven)
-    # The driver served the request: prebuilt archives for the standard
-    # library and the replaced module, and a compiled test variant.
+    # The driver served the request from prebuilt archives alone: the
+    # standard library's, the replaced module's and the test variants'.
     assert(driven.contains("\"declined\"") == false, "export driver declined: " + driven)
     assert(driven.contains("\"prebuilt\":"), "export driver used no prebuilt archive: " + driven)
-    assert(driven.contains("\"compiled\":"), "export driver compiled no test variant: " + driven)
+    assert(driven.contains("\"compiled\":") == false, "export driver compiled what the archives have: " + driven)
     null
   }
 
@@ -242,6 +242,8 @@ type E2e {
       .withoutEntrypoint
       .withDirectory("/src", ws.directory("/helpers/export-driver"))
       .withWorkdir("/src")
+      .withExec(["go", "test", "./..."])
+      .withWorkdir("/src/manifest")
       .withExec(["go", "test", "./..."])
       .sync
     null
