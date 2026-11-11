@@ -38,7 +38,7 @@ func readListing(dir string) (pkgs map[string]*listed, ok bool, err error) {
 	if err != nil {
 		return nil, false, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	pkgs = map[string]*listed{}
 	dec := json.NewDecoder(f)
 	for {
@@ -240,7 +240,7 @@ func inModule(ip, modPath string) (string, bool) {
 // patternPackage is the import path of the package a directory pattern,
 // relative to cwd, names in the main module. Other patterns are declined.
 func patternPackage(cwd, modDir, modPath, pattern string) (string, error) {
-	if strings.Contains(pattern, "...") || !(pattern == "." || strings.HasPrefix(pattern, "./") || strings.HasPrefix(pattern, "../")) {
+	if strings.Contains(pattern, "...") || pattern != "." && !strings.HasPrefix(pattern, "./") && !strings.HasPrefix(pattern, "../") {
 		return "", fmt.Errorf("pattern %q is not a directory", pattern)
 	}
 	rel, err := filepath.Rel(modDir, filepath.Join(cwd, pattern))
