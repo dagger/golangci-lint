@@ -96,7 +96,10 @@ func serveFromListing(m *manifest.Manifest, dir string, listing map[string]*list
 			return p, nil
 		}
 		var imports []string
-		if rel, own := inModule(ip, modPath); own {
+		// A package the listing has is another module's, even under the main
+		// module's path, such as a separately versioned submodule's.
+		_, listed := listing[ip]
+		if rel, own := inModule(ip, modPath); own && !listed {
 			pkgDir := filepath.Join(modDir, filepath.FromSlash(rel))
 			if nested, err := nestedModule(modDir, pkgDir); err != nil {
 				return nil, err

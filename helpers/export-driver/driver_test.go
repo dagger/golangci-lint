@@ -1023,3 +1023,57 @@ func TestListingServesWithoutGoList(t *testing.T) {
 		t.Errorf("fmt's export data is %q, not its archive", fmtPkg.ExportFile)
 	}
 }
+
+// TestListingServesSubmoduleFromArchives checks that a package under the main
+// module's path that the listing has, from a separately versioned module, is
+// served from its archive like any dependency, not read as the main module's.
+func TestListingServesSubmoduleFromArchives(t *testing.T) {
+	mod := t.TempDir()
+	writeFiles(t, mod, map[string]string{
+		"go.mod":     "module example.com/m\n\ngo " + toolchainLang() + "\n\nrequire example.com/m/lib v0.0.0\n\nreplace example.com/m/lib => ./lib\n",
+		"app/app.go": "package app\n\nimport \"example.com/m/lib\"\n\n// Use uses lib.\nfunc Use() int { return lib.V }\n",
+		"lib/go.mod": "module example.com/m/lib\n\ngo " + toolchainLang() + "\n",
+		"lib/lib.go": "package lib\n\n// V is a value.\nconst V = 1\n",
+	})
+	archives := archivesFor(t, mod)
+	list := exec.Command("go", "list", "-deps", "-json="+manifest.ListingFields+",Module", "./app")
+	list.Dir = mod
+	out, err := list.Output()
+	if err != nil {
+		t.Fatalf("go list: %v", err)
+	}
+	var listing bytes.Buffer
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for dec.More() {
+		var p map[string]any
+		if err := dec.Decode(&p); err != nil {
+			t.Fatal(err)
+		}
+		if m, ok := p["Module"].(map[string]any); ok && m["Main"] == true {
+			continue
+		}
+		delete(p, "Module")
+		if err := json.NewEncoder(&listing).Encode(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(archives, manifest.ListingFile), listing.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(mod)
+	t.Setenv(envArchives, archives)
+	t.Setenv(envCompile, "never")
+	resp, rep, err := serve(context.Background(), &packages.DriverRequest{
+		Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedModule | packages.NeedExportFile,
+		Env:  os.Environ(),
+	}, []string{"./app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.NotHandled {
+		t.Fatalf("declined: %s", rep.Declined)
+	}
+	if lib := packageByID(t, resp, "example.com/m/lib"); !strings.HasPrefix(lib.ExportFile, archives) || len(lib.GoFiles) != 0 {
+		t.Errorf("the submodule's package has export data %q and files %v, want its archive and no files", lib.ExportFile, lib.GoFiles)
+	}
+}
