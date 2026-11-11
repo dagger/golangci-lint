@@ -57,6 +57,9 @@ type report struct {
 	// ListedCompiled is set when the manifest didn't give every package's
 	// compiled files, so the go command listed them, running cgo.
 	ListedCompiled bool `json:"listedCompiled,omitempty"`
+	// FromListing is set when the builder's listing answered the request,
+	// with no go command.
+	FromListing bool `json:"fromListing,omitempty"`
 }
 
 func runDriver(ctx context.Context, patterns []string, stdin io.Reader, stdout io.Writer) error {
@@ -140,6 +143,17 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 	tags := buildTags(append(goflags, req.BuildFlags...))
 	if !sameStrings(tags, nonNil(m.BuildTags)) {
 		return declined(fmt.Sprintf("archives built with tags %v, request has %v", m.BuildTags, tags))
+	}
+	// A caller that reads declarations only, without tests, is answered
+	// from the builder's listing when there is one.
+	if os.Getenv(envCompile) == "never" && !req.Tests {
+		listing, ok, err := readListing(dir)
+		if err != nil {
+			return declined("listing: " + err.Error())
+		}
+		if ok {
+			return serveFromListing(m, dir, listing, env, tags, patterns)
+		}
 	}
 	linterGo, err := linterGoVersion()
 	if err != nil {

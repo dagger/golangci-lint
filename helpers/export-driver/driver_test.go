@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"go/parser"
@@ -915,4 +916,110 @@ func linterIs(t *testing.T, v string) {
 	old := linterGoVersion
 	linterGoVersion = func() (string, error) { return v, nil }
 	t.Cleanup(func() { linterGoVersion = old })
+}
+
+// TestListingServesWithoutGoList checks that a caller reading declarations
+// only, without tests, is answered from the builder's listing with no go list:
+// the go command on PATH runs `go env` and nothing else, so neither the module
+// cache nor the go command's package loading is read. The module's own
+// packages are read from their files as they are, so an edit after the
+// listing is seen, and the standard library comes from the archives.
+func TestListingServesWithoutGoList(t *testing.T) {
+	mod := writeModule(t, toolchainLang())
+	archives := archivesFor(t, mod)
+	// The listing a builder writes: the packages outside the main module.
+	list := exec.Command("go", "list", "-deps", "-json="+manifest.ListingFields+",Module", "./app")
+	list.Dir = mod
+	out, err := list.Output()
+	if err != nil {
+		t.Fatalf("go list: %v", err)
+	}
+	var listing bytes.Buffer
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for dec.More() {
+		var p map[string]any
+		if err := dec.Decode(&p); err != nil {
+			t.Fatal(err)
+		}
+		if mod, ok := p["Module"].(map[string]any); ok && mod["Main"] == true {
+			continue
+		}
+		delete(p, "Module")
+		if err := json.NewEncoder(&listing).Encode(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(archives, manifest.ListingFile), listing.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeFiles(t, mod, map[string]string{"lib/newer.go": "package lib\n\n// Newer is newer.\nfunc Newer() int { return 3 }\n"})
+
+	bin := filepath.Join(t.TempDir(), "export-driver")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = mustGetwdOf(t)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build driver: %v\n%s", err, out)
+	}
+	realGo, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := t.TempDir()
+	script := "#!/bin/sh\n[ \"$1\" = env ] && exec " + strconv.Quote(realGo) + " \"$@\"\necho \"go $*: only go env may run\" >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(stub, "go"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reportLog := filepath.Join(t.TempDir(), "report.log")
+	t.Chdir(mod)
+	pkgs, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedModule | packages.NeedExportFile,
+		Env: append(os.Environ(),
+			"PATH="+stub+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"GOPACKAGESDRIVER="+bin,
+			envArchives+"="+archives,
+			envWorkDir+"="+t.TempDir(),
+			envCompile+"=never",
+			envLog+"="+reportLog,
+		),
+	}, "./app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := packages.PrintErrors(pkgs); n > 0 {
+		t.Fatalf("%d errors loading through the driver", n)
+	}
+	var rep report
+	data, err := os.ReadFile(reportLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &rep); err != nil {
+		t.Fatal(err)
+	}
+	if !rep.FromListing || rep.Declined != "" || rep.Prebuilt == 0 {
+		t.Errorf("report = %+v, want the listing to answer", rep)
+	}
+	var newer bool
+	for _, imp := range pkgs[0].Types.Imports() {
+		if imp.Path() == "example.com/m/lib" && imp.Scope().Lookup("Newer") != nil {
+			newer = true
+		}
+	}
+	if !newer {
+		t.Error("app's import lib was not type-checked from its files as they are: Newer is missing")
+	}
+	// go/packages keeps no imports for a caller that doesn't ask for them, so
+	// the driver's own answer shows where fmt's export data comes from.
+	t.Setenv(envArchives, archives)
+	t.Setenv(envCompile, "never")
+	resp, _, err := serve(context.Background(), &packages.DriverRequest{
+		Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedModule | packages.NeedExportFile,
+		Env:  os.Environ(),
+	}, []string{"./app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmtPkg := packageByID(t, resp, "fmt"); !strings.HasPrefix(fmtPkg.ExportFile, archives) {
+		t.Errorf("fmt's export data is %q, not its archive", fmtPkg.ExportFile)
+	}
 }
