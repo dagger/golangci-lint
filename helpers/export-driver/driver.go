@@ -38,6 +38,12 @@ const (
 	// compiles no package, and serves a module whatever its Go language
 	// version.
 	envCompile = "GOLANGCI_EXPORT_COMPILE"
+	// envGo is the Go language version ("1.25") the caller type-checks at,
+	// for a caller told the module's version on its own, as staticcheck's
+	// -go flag tells it, since a package served by a driver carries no
+	// Module: the driver serves a module of that language version to a
+	// caller built with that Go or a newer one.
+	envGo = "GOLANGCI_EXPORT_GO"
 )
 
 // report is the JSON line written to envLog for each request.
@@ -202,16 +208,24 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 	}
 
 	// Through a driver the caller loses Module, so it type-checks with the
-	// Go version it was built with instead of the module's. Only serve
-	// modules whose language version that is, so that a lint's findings
-	// are the module's own; a caller that reads declarations only accepts
-	// at a newer language version all that the module's accepts.
+	// Go version it was built with instead of the module's, unless it is
+	// told the module's (envGo). Only serve modules whose language version
+	// the caller type-checks at, so that a lint's findings are the module's
+	// own; a caller that reads declarations only accepts at a newer
+	// language version all that the module's accepts.
+	checksAt, told := langVersion(linterGo), os.Getenv(envGo)
+	if told != "" {
+		if goMinor(linterGo) < goMinor(told) {
+			return declined(fmt.Sprintf("caller type-checks at go %s, but was built with %s", told, linterGo))
+		}
+		checksAt = langVersion(told)
+	}
 	for _, root := range roots {
 		if root.Module == nil || root.Module.GoVersion == "" {
 			return declined("package " + root.ID + " has no module Go version")
 		}
-		if os.Getenv(envCompile) != "never" && langVersion(root.Module.GoVersion) != langVersion(linterGo) {
-			return declined(fmt.Sprintf("module %s is go %s, linter built with %s", root.Module.Path, root.Module.GoVersion, linterGo))
+		if os.Getenv(envCompile) != "never" && langVersion(root.Module.GoVersion) != checksAt {
+			return declined(fmt.Sprintf("module %s is go %s, caller type-checks at go %s", root.Module.Path, root.Module.GoVersion, checksAt))
 		}
 	}
 

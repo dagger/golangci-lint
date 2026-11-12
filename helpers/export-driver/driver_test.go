@@ -341,6 +341,7 @@ func TestDeclines(t *testing.T) {
 		mutate   func(*packages.DriverRequest)
 		linter   string
 		module   string
+		checksAt string
 	}{
 		{name: "no archives", archives: func(*testing.T) string { return "" }},
 		{name: "other toolchain", archives: func(t *testing.T) string {
@@ -358,6 +359,10 @@ func TestDeclines(t *testing.T) {
 		{name: "linter built with another Go", archives: func(t *testing.T) string { return archives },
 			linter: "go1.1.0"},
 		{name: "module on an older Go", archives: func(t *testing.T) string { return archives }, module: "1.22"},
+		{name: "module on another Go than the caller type-checks at", archives: func(t *testing.T) string { return archives },
+			module: "1.22", checksAt: "1.23"},
+		{name: "caller type-checks at a newer Go than it was built with", archives: func(t *testing.T) string { return archives },
+			checksAt: "1.99"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -373,6 +378,9 @@ func TestDeclines(t *testing.T) {
 			if tc.linter != "" {
 				linterIs(t, tc.linter)
 			}
+			if tc.checksAt != "" {
+				t.Setenv(envGo, tc.checksAt)
+			}
 			req := &packages.DriverRequest{Mode: golangciMode, Env: os.Environ(), Tests: true, BuildFlags: golangciFlags}
 			if tc.mutate != nil {
 				tc.mutate(req)
@@ -385,6 +393,23 @@ func TestDeclines(t *testing.T) {
 				t.Fatalf("served a request it must decline: %+v", rep)
 			}
 		})
+	}
+}
+
+// TestToldGoVersionServesOlderModule checks that a caller built with a newer
+// Go than a module's, told the module's language version through envGo, as
+// staticcheck's -go flag tells it, is served that module's archives, as a
+// caller built with the module's own Go is.
+func TestToldGoVersionServesOlderModule(t *testing.T) {
+	mod := writeModule(t, "1.22")
+	archives := archivesFor(t, mod)
+	t.Setenv(envGo, "1.22")
+	resp, rep := serveModule(t, mod, archives, nil)
+	if resp.NotHandled {
+		t.Fatalf("declined: %s", rep.Declined)
+	}
+	if rep.Prebuilt == 0 || len(rep.Missing) != 0 {
+		t.Errorf("report = %+v, want the archives served", rep)
 	}
 }
 
