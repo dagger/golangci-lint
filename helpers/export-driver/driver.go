@@ -151,8 +151,12 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 		return declined(fmt.Sprintf("archives built with tags %v, request has %v", m.BuildTags, tags))
 	}
 	// A caller that reads declarations only, without tests, is answered
-	// from the builder's listing when there is one.
-	if os.Getenv(envCompile) == "never" && !req.Tests {
+	// from the builder's listing when there is one. One that reads its
+	// dependencies' syntax or type information, which go/packages then
+	// loads from their files, needs those files, which the listing doesn't
+	// give.
+	depsFromSource := req.Mode&packages.NeedDeps != 0 && req.Mode&(packages.NeedSyntax|packages.NeedTypesInfo) != 0
+	if os.Getenv(envCompile) == "never" && !req.Tests && !depsFromSource {
 		listing, ok, err := readListing(dir)
 		if err != nil {
 			return declined("listing: " + err.Error())

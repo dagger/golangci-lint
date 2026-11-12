@@ -1047,6 +1047,21 @@ func TestListingServesWithoutGoList(t *testing.T) {
 	if fmtPkg := packageByID(t, resp, "fmt"); !strings.HasPrefix(fmtPkg.ExportFile, archives) {
 		t.Errorf("fmt's export data is %q, not its archive", fmtPkg.ExportFile)
 	}
+	// A caller that reads its dependencies' syntax needs their files, which
+	// the listing doesn't give: it is answered through the go command.
+	all, err := packages.Load(&packages.Config{
+		Mode: packages.LoadAllSyntax,
+		Env: append(os.Environ(),
+			"GOPACKAGESDRIVER="+bin,
+			envWorkDir+"="+t.TempDir(),
+		),
+	}, "./app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := packages.PrintErrors(all); n > 0 {
+		t.Fatalf("%d errors loading the dependencies' syntax through the driver", n)
+	}
 }
 
 // TestListingServesSubmoduleFromArchives checks that a package under the main
