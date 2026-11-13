@@ -1064,6 +1064,84 @@ func TestListingServesWithoutGoList(t *testing.T) {
 	}
 }
 
+// TestListingDeclinesDependencyImportingMainModule checks that a caller is
+// not answered from the listing when another module's package imports one of
+// the main module's: go/packages type-checks that package from source, the
+// main module's being, and the listing has no files for it, so it reports
+// "sources missing" on it to a caller that reads the roots' imports. The go
+// command answers such a caller instead, and the load has no errors. A
+// caller that doesn't read them, such as code generation, which takes any
+// decline as a failure, is still answered from the listing.
+func TestListingDeclinesDependencyImportingMainModule(t *testing.T) {
+	mod := t.TempDir()
+	writeFiles(t, mod, map[string]string{
+		"go.mod":     "module example.com/m\n\ngo " + toolchainLang() + "\n\nrequire example.com/dep v0.0.0\n\nreplace example.com/dep => ./dep\n",
+		"app/app.go": "package app\n\nimport \"example.com/dep\"\n\n// Use uses dep.\nfunc Use() int { return dep.V }\n",
+		"lib/lib.go": "package lib\n\n// V is a value.\nconst V = 1\n",
+		"dep/go.mod": "module example.com/dep\n\ngo " + toolchainLang() + "\n\nrequire example.com/m v0.0.0\n",
+		"dep/dep.go": "package dep\n\nimport \"example.com/m/lib\"\n\n// V is lib's value.\nconst V = lib.V\n",
+	})
+	archives := archivesFor(t, mod)
+	list := exec.Command("go", "list", "-deps", "-json="+manifest.ListingFields+",Module", "./app")
+	list.Dir = mod
+	out, err := list.Output()
+	if err != nil {
+		t.Fatalf("go list: %v", err)
+	}
+	var listing bytes.Buffer
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for dec.More() {
+		var p map[string]any
+		if err := dec.Decode(&p); err != nil {
+			t.Fatal(err)
+		}
+		if m, ok := p["Module"].(map[string]any); ok && m["Main"] == true {
+			continue
+		}
+		delete(p, "Module")
+		if err := json.NewEncoder(&listing).Encode(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(archives, manifest.ListingFile), listing.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(t.TempDir(), "export-driver")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = mustGetwdOf(t)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build driver: %v\n%s", err, out)
+	}
+	t.Chdir(mod)
+	t.Setenv(envArchives, archives)
+	t.Setenv(envCompile, "never")
+	resp, rep, err := serve(context.Background(), &packages.DriverRequest{
+		Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedModule | packages.NeedExportFile,
+		Env:  os.Environ(),
+	}, []string{"./app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.NotHandled || !rep.FromListing {
+		t.Errorf("code generation's load was not answered from the listing: %+v", rep)
+	}
+	pkgs, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName | packages.NeedImports | packages.NeedTypes | packages.NeedSyntax | packages.NeedModule | packages.NeedExportFile,
+		Env: append(os.Environ(),
+			"GOPACKAGESDRIVER="+bin,
+			envArchives+"="+archives,
+			envWorkDir+"="+t.TempDir(),
+			envCompile+"=never",
+		),
+	}, "./app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := packages.PrintErrors(pkgs); n > 0 {
+		t.Fatalf("%d errors loading a module whose dependency imports its package", n)
+	}
+}
+
 // TestListingServesSubmoduleFromArchives checks that a package under the main
 // module's path that the listing has, from a separately versioned module, is
 // served from its archive like any dependency, not read as the main module's.

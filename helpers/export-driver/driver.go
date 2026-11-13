@@ -162,7 +162,7 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 			return declined("listing: " + err.Error())
 		}
 		if ok {
-			return serveFromListing(m, dir, listing, env, tags, patterns)
+			return serveFromListing(m, dir, listing, env, tags, patterns, req.Mode)
 		}
 	}
 	linterGo, err := linterGoVersion()

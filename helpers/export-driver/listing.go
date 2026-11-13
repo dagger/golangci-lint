@@ -63,7 +63,7 @@ func readListing(dir string) (pkgs map[string]*listed, ok bool, err error) {
 // module is the one whose go.mod is nearest the working directory. The
 // archives' packages and the listing come from one plan, so they agree; the
 // main module's are read afresh, so they are never stale.
-func serveFromListing(m *manifest.Manifest, dir string, listing map[string]*listed, env map[string]string, tags []string, patterns []string) (*packages.DriverResponse, report, error) {
+func serveFromListing(m *manifest.Manifest, dir string, listing map[string]*listed, env map[string]string, tags []string, patterns []string, mode packages.LoadMode) (*packages.DriverResponse, report, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, report{}, err
@@ -132,6 +132,15 @@ func serveFromListing(m *manifest.Manifest, dir string, listing map[string]*list
 			for _, imp := range l.Imports {
 				if mapped, ok := l.ImportMap[imp]; ok {
 					imp = mapped
+				}
+				// The caller type-checks a main module's package from source,
+				// so go/packages type-checks every package importing it from
+				// source too, and an archived one has no files to give it: it
+				// falls back to its export data, and reports "sources missing"
+				// on it, which a caller sees through the roots' imports. One
+				// that doesn't read them gets a clean load.
+				if _, own := inModule(imp, modPath); own && listing[imp] == nil && mode&packages.NeedImports != 0 {
+					return nil, fmt.Errorf("package %s, of another module, imports %s of the main module", ip, imp)
 				}
 				imports = append(imports, imp)
 			}
