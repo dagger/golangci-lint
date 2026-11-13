@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"go/parser"
@@ -340,6 +341,7 @@ func TestDeclines(t *testing.T) {
 		mutate   func(*packages.DriverRequest)
 		linter   string
 		module   string
+		checksAt string
 	}{
 		{name: "no archives", archives: func(*testing.T) string { return "" }},
 		{name: "other toolchain", archives: func(t *testing.T) string {
@@ -357,6 +359,10 @@ func TestDeclines(t *testing.T) {
 		{name: "linter built with another Go", archives: func(t *testing.T) string { return archives },
 			linter: "go1.1.0"},
 		{name: "module on an older Go", archives: func(t *testing.T) string { return archives }, module: "1.22"},
+		{name: "module on another Go than the caller type-checks at", archives: func(t *testing.T) string { return archives },
+			module: "1.22", checksAt: "1.23"},
+		{name: "caller type-checks at a newer Go than it was built with", archives: func(t *testing.T) string { return archives },
+			checksAt: "1.99"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -372,6 +378,9 @@ func TestDeclines(t *testing.T) {
 			if tc.linter != "" {
 				linterIs(t, tc.linter)
 			}
+			if tc.checksAt != "" {
+				t.Setenv(envGo, tc.checksAt)
+			}
 			req := &packages.DriverRequest{Mode: golangciMode, Env: os.Environ(), Tests: true, BuildFlags: golangciFlags}
 			if tc.mutate != nil {
 				tc.mutate(req)
@@ -384,6 +393,23 @@ func TestDeclines(t *testing.T) {
 				t.Fatalf("served a request it must decline: %+v", rep)
 			}
 		})
+	}
+}
+
+// TestToldGoVersionServesOlderModule checks that a caller built with a newer
+// Go than a module's, told the module's language version through envGo, as
+// staticcheck's -go flag tells it, is served that module's archives, as a
+// caller built with the module's own Go is.
+func TestToldGoVersionServesOlderModule(t *testing.T) {
+	mod := writeModule(t, "1.22")
+	archives := archivesFor(t, mod)
+	t.Setenv(envGo, "1.22")
+	resp, rep := serveModule(t, mod, archives, nil)
+	if resp.NotHandled {
+		t.Fatalf("declined: %s", rep.Declined)
+	}
+	if rep.Prebuilt == 0 || len(rep.Missing) != 0 {
+		t.Errorf("report = %+v, want the archives served", rep)
 	}
 }
 
@@ -915,4 +941,257 @@ func linterIs(t *testing.T, v string) {
 	old := linterGoVersion
 	linterGoVersion = func() (string, error) { return v, nil }
 	t.Cleanup(func() { linterGoVersion = old })
+}
+
+// TestListingServesWithoutGoList checks that a caller reading declarations
+// only, without tests, is answered from the builder's listing with no go list:
+// the go command on PATH runs `go env` and nothing else, so neither the module
+// cache nor the go command's package loading is read. The module's own
+// packages are read from their files as they are, so an edit after the
+// listing is seen, and the standard library comes from the archives.
+func TestListingServesWithoutGoList(t *testing.T) {
+	mod := writeModule(t, toolchainLang())
+	archives := archivesFor(t, mod)
+	// The listing a builder writes: the packages outside the main module.
+	list := exec.Command("go", "list", "-deps", "-json="+manifest.ListingFields+",Module", "./app")
+	list.Dir = mod
+	out, err := list.Output()
+	if err != nil {
+		t.Fatalf("go list: %v", err)
+	}
+	var listing bytes.Buffer
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for dec.More() {
+		var p map[string]any
+		if err := dec.Decode(&p); err != nil {
+			t.Fatal(err)
+		}
+		if mod, ok := p["Module"].(map[string]any); ok && mod["Main"] == true {
+			continue
+		}
+		delete(p, "Module")
+		if err := json.NewEncoder(&listing).Encode(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(archives, manifest.ListingFile), listing.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeFiles(t, mod, map[string]string{"lib/newer.go": "package lib\n\n// Newer is newer.\nfunc Newer() int { return 3 }\n"})
+
+	bin := filepath.Join(t.TempDir(), "export-driver")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = mustGetwdOf(t)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build driver: %v\n%s", err, out)
+	}
+	realGo, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := t.TempDir()
+	script := "#!/bin/sh\n[ \"$1\" = env ] && exec " + strconv.Quote(realGo) + " \"$@\"\necho \"go $*: only go env may run\" >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(stub, "go"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reportLog := filepath.Join(t.TempDir(), "report.log")
+	t.Chdir(mod)
+	pkgs, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedModule | packages.NeedExportFile,
+		Env: append(os.Environ(),
+			"PATH="+stub+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"GOPACKAGESDRIVER="+bin,
+			envArchives+"="+archives,
+			envWorkDir+"="+t.TempDir(),
+			envCompile+"=never",
+			envLog+"="+reportLog,
+		),
+	}, "./app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := packages.PrintErrors(pkgs); n > 0 {
+		t.Fatalf("%d errors loading through the driver", n)
+	}
+	var rep report
+	data, err := os.ReadFile(reportLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &rep); err != nil {
+		t.Fatal(err)
+	}
+	if !rep.FromListing || rep.Declined != "" || rep.Prebuilt == 0 {
+		t.Errorf("report = %+v, want the listing to answer", rep)
+	}
+	var newer bool
+	for _, imp := range pkgs[0].Types.Imports() {
+		if imp.Path() == "example.com/m/lib" && imp.Scope().Lookup("Newer") != nil {
+			newer = true
+		}
+	}
+	if !newer {
+		t.Error("app's import lib was not type-checked from its files as they are: Newer is missing")
+	}
+	// go/packages keeps no imports for a caller that doesn't ask for them, so
+	// the driver's own answer shows where fmt's export data comes from.
+	t.Setenv(envArchives, archives)
+	t.Setenv(envCompile, "never")
+	resp, _, err := serve(context.Background(), &packages.DriverRequest{
+		Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedModule | packages.NeedExportFile,
+		Env:  os.Environ(),
+	}, []string{"./app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmtPkg := packageByID(t, resp, "fmt"); !strings.HasPrefix(fmtPkg.ExportFile, archives) {
+		t.Errorf("fmt's export data is %q, not its archive", fmtPkg.ExportFile)
+	}
+	// A caller that reads its dependencies' syntax needs their files, which
+	// the listing doesn't give: it is answered through the go command.
+	all, err := packages.Load(&packages.Config{
+		Mode: packages.LoadAllSyntax,
+		Env: append(os.Environ(),
+			"GOPACKAGESDRIVER="+bin,
+			envWorkDir+"="+t.TempDir(),
+		),
+	}, "./app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := packages.PrintErrors(all); n > 0 {
+		t.Fatalf("%d errors loading the dependencies' syntax through the driver", n)
+	}
+}
+
+// TestListingDeclinesDependencyImportingMainModule checks that a caller is
+// not answered from the listing when another module's package imports one of
+// the main module's: go/packages type-checks that package from source, the
+// main module's being, and the listing has no files for it, so it reports
+// "sources missing" on it to a caller that reads the roots' imports. The go
+// command answers such a caller instead, and the load has no errors. A
+// caller that doesn't read them, such as code generation, which takes any
+// decline as a failure, is still answered from the listing.
+func TestListingDeclinesDependencyImportingMainModule(t *testing.T) {
+	mod := t.TempDir()
+	writeFiles(t, mod, map[string]string{
+		"go.mod":     "module example.com/m\n\ngo " + toolchainLang() + "\n\nrequire example.com/dep v0.0.0\n\nreplace example.com/dep => ./dep\n",
+		"app/app.go": "package app\n\nimport \"example.com/dep\"\n\n// Use uses dep.\nfunc Use() int { return dep.V }\n",
+		"lib/lib.go": "package lib\n\n// V is a value.\nconst V = 1\n",
+		"dep/go.mod": "module example.com/dep\n\ngo " + toolchainLang() + "\n\nrequire example.com/m v0.0.0\n",
+		"dep/dep.go": "package dep\n\nimport \"example.com/m/lib\"\n\n// V is lib's value.\nconst V = lib.V\n",
+	})
+	archives := archivesFor(t, mod)
+	list := exec.Command("go", "list", "-deps", "-json="+manifest.ListingFields+",Module", "./app")
+	list.Dir = mod
+	out, err := list.Output()
+	if err != nil {
+		t.Fatalf("go list: %v", err)
+	}
+	var listing bytes.Buffer
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for dec.More() {
+		var p map[string]any
+		if err := dec.Decode(&p); err != nil {
+			t.Fatal(err)
+		}
+		if m, ok := p["Module"].(map[string]any); ok && m["Main"] == true {
+			continue
+		}
+		delete(p, "Module")
+		if err := json.NewEncoder(&listing).Encode(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(archives, manifest.ListingFile), listing.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(t.TempDir(), "export-driver")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = mustGetwdOf(t)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build driver: %v\n%s", err, out)
+	}
+	t.Chdir(mod)
+	t.Setenv(envArchives, archives)
+	t.Setenv(envCompile, "never")
+	resp, rep, err := serve(context.Background(), &packages.DriverRequest{
+		Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedModule | packages.NeedExportFile,
+		Env:  os.Environ(),
+	}, []string{"./app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.NotHandled || !rep.FromListing {
+		t.Errorf("code generation's load was not answered from the listing: %+v", rep)
+	}
+	pkgs, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName | packages.NeedImports | packages.NeedTypes | packages.NeedSyntax | packages.NeedModule | packages.NeedExportFile,
+		Env: append(os.Environ(),
+			"GOPACKAGESDRIVER="+bin,
+			envArchives+"="+archives,
+			envWorkDir+"="+t.TempDir(),
+			envCompile+"=never",
+		),
+	}, "./app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := packages.PrintErrors(pkgs); n > 0 {
+		t.Fatalf("%d errors loading a module whose dependency imports its package", n)
+	}
+}
+
+// TestListingServesSubmoduleFromArchives checks that a package under the main
+// module's path that the listing has, from a separately versioned module, is
+// served from its archive like any dependency, not read as the main module's.
+func TestListingServesSubmoduleFromArchives(t *testing.T) {
+	mod := t.TempDir()
+	writeFiles(t, mod, map[string]string{
+		"go.mod":     "module example.com/m\n\ngo " + toolchainLang() + "\n\nrequire example.com/m/lib v0.0.0\n\nreplace example.com/m/lib => ./lib\n",
+		"app/app.go": "package app\n\nimport \"example.com/m/lib\"\n\n// Use uses lib.\nfunc Use() int { return lib.V }\n",
+		"lib/go.mod": "module example.com/m/lib\n\ngo " + toolchainLang() + "\n",
+		"lib/lib.go": "package lib\n\n// V is a value.\nconst V = 1\n",
+	})
+	archives := archivesFor(t, mod)
+	list := exec.Command("go", "list", "-deps", "-json="+manifest.ListingFields+",Module", "./app")
+	list.Dir = mod
+	out, err := list.Output()
+	if err != nil {
+		t.Fatalf("go list: %v", err)
+	}
+	var listing bytes.Buffer
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for dec.More() {
+		var p map[string]any
+		if err := dec.Decode(&p); err != nil {
+			t.Fatal(err)
+		}
+		if m, ok := p["Module"].(map[string]any); ok && m["Main"] == true {
+			continue
+		}
+		delete(p, "Module")
+		if err := json.NewEncoder(&listing).Encode(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(archives, manifest.ListingFile), listing.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(mod)
+	t.Setenv(envArchives, archives)
+	t.Setenv(envCompile, "never")
+	resp, rep, err := serve(context.Background(), &packages.DriverRequest{
+		Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedModule | packages.NeedExportFile,
+		Env:  os.Environ(),
+	}, []string{"./app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.NotHandled {
+		t.Fatalf("declined: %s", rep.Declined)
+	}
+	if lib := packageByID(t, resp, "example.com/m/lib"); !strings.HasPrefix(lib.ExportFile, archives) || len(lib.GoFiles) != 0 {
+		t.Errorf("the submodule's package has export data %q and files %v, want its archive and no files", lib.ExportFile, lib.GoFiles)
+	}
 }

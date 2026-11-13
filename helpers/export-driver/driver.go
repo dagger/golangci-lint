@@ -38,6 +38,12 @@ const (
 	// compiles no package, and serves a module whatever its Go language
 	// version.
 	envCompile = "GOLANGCI_EXPORT_COMPILE"
+	// envGo is the Go language version ("1.25") the caller type-checks at,
+	// for a caller told the module's version on its own, as staticcheck's
+	// -go flag tells it, since a package served by a driver carries no
+	// Module: the driver serves a module of that language version to a
+	// caller built with that Go or a newer one.
+	envGo = "GOLANGCI_EXPORT_GO"
 )
 
 // report is the JSON line written to envLog for each request.
@@ -57,6 +63,9 @@ type report struct {
 	// ListedCompiled is set when the manifest didn't give every package's
 	// compiled files, so the go command listed them, running cgo.
 	ListedCompiled bool `json:"listedCompiled,omitempty"`
+	// FromListing is set when the builder's listing answered the request,
+	// with no go command.
+	FromListing bool `json:"fromListing,omitempty"`
 }
 
 func runDriver(ctx context.Context, patterns []string, stdin io.Reader, stdout io.Writer) error {
@@ -141,6 +150,21 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 	if !sameStrings(tags, nonNil(m.BuildTags)) {
 		return declined(fmt.Sprintf("archives built with tags %v, request has %v", m.BuildTags, tags))
 	}
+	// A caller that reads declarations only, without tests, is answered
+	// from the builder's listing when there is one. One that reads its
+	// dependencies' syntax or type information, which go/packages then
+	// loads from their files, needs those files, which the listing doesn't
+	// give.
+	depsFromSource := req.Mode&packages.NeedDeps != 0 && req.Mode&(packages.NeedSyntax|packages.NeedTypesInfo) != 0
+	if os.Getenv(envCompile) == "never" && !req.Tests && !depsFromSource {
+		listing, ok, err := readListing(dir)
+		if err != nil {
+			return declined("listing: " + err.Error())
+		}
+		if ok {
+			return serveFromListing(m, dir, listing, env, tags, patterns, req.Mode)
+		}
+	}
 	linterGo, err := linterGoVersion()
 	if err != nil {
 		return declined("linter Go version: " + err.Error())
@@ -188,16 +212,24 @@ func serve(ctx context.Context, req *packages.DriverRequest, patterns []string) 
 	}
 
 	// Through a driver the caller loses Module, so it type-checks with the
-	// Go version it was built with instead of the module's. Only serve
-	// modules whose language version that is, so that a lint's findings
-	// are the module's own; a caller that reads declarations only accepts
-	// at a newer language version all that the module's accepts.
+	// Go version it was built with instead of the module's, unless it is
+	// told the module's (envGo). Only serve modules whose language version
+	// the caller type-checks at, so that a lint's findings are the module's
+	// own; a caller that reads declarations only accepts at a newer
+	// language version all that the module's accepts.
+	checksAt, told := langVersion(linterGo), os.Getenv(envGo)
+	if told != "" {
+		if goMinor(linterGo) < goMinor(told) {
+			return declined(fmt.Sprintf("caller type-checks at go %s, but was built with %s", told, linterGo))
+		}
+		checksAt = langVersion(told)
+	}
 	for _, root := range roots {
 		if root.Module == nil || root.Module.GoVersion == "" {
 			return declined("package " + root.ID + " has no module Go version")
 		}
-		if os.Getenv(envCompile) != "never" && langVersion(root.Module.GoVersion) != langVersion(linterGo) {
-			return declined(fmt.Sprintf("module %s is go %s, linter built with %s", root.Module.Path, root.Module.GoVersion, linterGo))
+		if os.Getenv(envCompile) != "never" && langVersion(root.Module.GoVersion) != checksAt {
+			return declined(fmt.Sprintf("module %s is go %s, caller type-checks at go %s", root.Module.Path, root.Module.GoVersion, checksAt))
 		}
 	}
 
