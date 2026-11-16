@@ -159,6 +159,11 @@ func serveFromListing(m *manifest.Manifest, dir string, listing map[string]*list
 	}
 
 	resp := &packages.DriverResponse{Compiler: "gc", Arch: env["GOARCH"], GoVersion: goMinor(env["GOVERSION"])}
+	// A caller that names no package, such as moq, loads the one in its
+	// directory, as the go command does.
+	if len(patterns) == 0 {
+		patterns = []string{"."}
+	}
 	for _, pattern := range patterns {
 		ip, err := patternPackage(cwd, modDir, modPath, pattern)
 		if err != nil {

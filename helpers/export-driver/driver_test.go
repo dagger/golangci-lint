@@ -996,16 +996,17 @@ func TestListingServesWithoutGoList(t *testing.T) {
 	}
 	reportLog := filepath.Join(t.TempDir(), "report.log")
 	t.Chdir(mod)
+	driverEnv := append(os.Environ(),
+		"PATH="+stub+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"GOPACKAGESDRIVER="+bin,
+		envArchives+"="+archives,
+		envWorkDir+"="+t.TempDir(),
+		envCompile+"=never",
+		envLog+"="+reportLog,
+	)
 	pkgs, err := packages.Load(&packages.Config{
 		Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedModule | packages.NeedExportFile,
-		Env: append(os.Environ(),
-			"PATH="+stub+string(os.PathListSeparator)+os.Getenv("PATH"),
-			"GOPACKAGESDRIVER="+bin,
-			envArchives+"="+archives,
-			envWorkDir+"="+t.TempDir(),
-			envCompile+"=never",
-			envLog+"="+reportLog,
-		),
+		Env:  driverEnv,
 	}, "./app")
 	if err != nil {
 		t.Fatal(err)
@@ -1032,6 +1033,19 @@ func TestListingServesWithoutGoList(t *testing.T) {
 	}
 	if !newer {
 		t.Error("app's import lib was not type-checked from its files as they are: Newer is missing")
+	}
+	// A caller that names no package, as moq does, is answered with the one
+	// in its directory, as the go command answers it.
+	here, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax,
+		Dir:  filepath.Join(mod, "app"),
+		Env:  driverEnv,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := packages.PrintErrors(here); n > 0 || len(here) != 1 || here[0].PkgPath != "example.com/m/app" {
+		t.Errorf("a load naming no package got %d packages and %d errors, want example.com/m/app", len(here), n)
 	}
 	// go/packages keeps no imports for a caller that doesn't ask for them, so
 	// the driver's own answer shows where fmt's export data comes from.
