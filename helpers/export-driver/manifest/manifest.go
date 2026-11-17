@@ -113,6 +113,17 @@ func (m *Manifest) Encode() ([]byte, error) {
 	return append(data, '\n'), nil
 }
 
+// ListingFile is the file in a manifest's directory, beside manifest.json,
+// that a builder may write with the listing its plan made of the packages
+// outside the main module: `go list -deps -json=ListingFields` output, one
+// package after another. With it, a caller that type-checks the main module
+// from source and loads every other package from the archives needs no go
+// command, and no module cache, to know them.
+const ListingFile = "listing.json"
+
+// ListingFields are the fields of `go list -json` ListingFile holds.
+const ListingFields = "ImportPath,Name,ForTest,Imports,ImportMap"
+
 // ListFields are the fields of `go list -json` a Package holds.
 const ListFields = "ImportPath,ForTest,Dir,Module,GoFiles,CgoFiles,CFiles,CXXFiles,MFiles,HFiles,FFiles,SFiles,SwigFiles,SwigCXXFiles,SysoFiles,EmbedFiles"
 
